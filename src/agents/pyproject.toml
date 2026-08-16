@@ -1,0 +1,44 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 64", "setuptools-scm>=8"]
+
+[tool.setuptools]
+py-modules = ["register"]
+
+[project]
+name = "acp-agents"
+version = "0.1.0"
+description = "NAT Agents for Agentic Commerce Protocol - Promotion and Post-Purchase agents"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # NAT with RAG (Milvus retriever), LangChain, Phoenix, profiler, and Ragas extras
+    "nvidia-nat[langchain,phoenix,profiler,rag,ragas]==1.7.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4.0",
+    "pyright>=1.1.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingImports = "warning"
+reportGeneralTypeIssues = "warning"
+reportCallIssue = "warning"
+
+[tool.uv] 
+managed = true
+
+[project.entry-points.'nat.components']
+acp_agents = "register"
