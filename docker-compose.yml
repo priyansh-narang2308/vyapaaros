@@ -1,0 +1,291 @@
+# Agentic Commerce Platform - Application Services
+#
+# Usage:
+#   Full Docker deployment (start infrastructure first):
+#     docker compose -f docker-compose.infra.yml -f docker-compose.yml up -d
+#
+#   Application services only (infrastructure already running):
+#     docker compose up -d
+#
+# For local development with just infrastructure:
+#   docker compose -f docker-compose.infra.yml up -d
+#   Then run services locally (uvicorn, pnpm dev, etc.)
+
+services:
+  # =============================================================================
+  # NGINX REVERSE PROXY
+  # =============================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      ui:
+        condition: service_started
+      merchant:
+        condition: service_healthy
+      psp:
+        condition: service_healthy
+      apps-sdk:
+        condition: service_healthy
+    networks:
+      - acp-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # APPLICATION SERVICES
+  # =============================================================================
+  
+  # Merchant API (Port 8000)
+  merchant:
+    build:
+      context: .
+      dockerfile: src/merchant/Dockerfile
+    container_name: merchant
+    expose:
+      - "8000"
+    environment:
+      - DATABASE_URL=sqlite:////data/agentic_commerce.db
+      # Authentication key for clients calling merchant API
+      - MERCHANT_API_KEY=${MERCHANT_API_KEY:-merchant-api-key-12345}
+      # Agent URLs for promotion and post-purchase flows
+      - PROMOTION_AGENT_URL=http://promotion-agent:8002
+      - POST_PURCHASE_AGENT_URL=http://post-purchase-agent:8003
+      - RECOMMENDATION_AGENT_URL=http://recommendation-agent:8004
+      # Webhook delivery to client agent (Docker-internal URL by default).
+      # Uses a dedicated env var so local WEBHOOK_URL (localhost) does not break container routing.
+      - WEBHOOK_URL=${WEBHOOK_URL_DOCKER:-http://ui:3000/api/webhooks/acp}
+      - UCP_ORDER_WEBHOOK_URL=${UCP_ORDER_WEBHOOK_URL_DOCKER:-http://ui:3000/api/webhooks/ucp}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-whsec_demo_secret}
+    volumes:
+      - acp-data:/data
+    networks:
+      - acp-network
+      - acp-infra-network
+    restart: unless-stopped
+
+  # PSP Service (Port 8001)
+  psp:
+    build:
+      context: .
+      dockerfile: src/payment/Dockerfile
+    container_name: psp
+    expose:
+      - "8001"
+    environment:
+      - DATABASE_URL=sqlite:////data/agentic_commerce.db
+      - PSP_API_KEY=${PSP_API_KEY:-psp-api-key-12345}
+    volumes:
+      - acp-data:/data
+    networks:
+      - acp-network
+    restart: unless-stopped
+
+  # Apps SDK MCP Server (Port 2091)
+  apps-sdk:
+    build:
+      context: .
+      dockerfile: src/apps_sdk/Dockerfile
+    container_name: apps-sdk
+    expose:
+      - "2091"
+    environment:
+      - MERCHANT_API_URL=http://merchant:8000
+      - PSP_API_URL=http://psp:8001
+      - RECOMMENDATION_AGENT_URL=http://recommendation-agent:8004
+      - SEARCH_AGENT_URL=http://search-agent:8005
+      - MERCHANT_API_KEY=${MERCHANT_API_KEY:-merchant-api-key-12345}
+      - PSP_API_KEY=${PSP_API_KEY:-psp-api-key-12345}
+    networks:
+      - acp-network
+    restart: unless-stopped
+
+  # Frontend UI (Port 3000)
+  ui:
+    build:
+      context: .
+      dockerfile: src/ui/Dockerfile
+    container_name: ui
+    expose:
+      - "3000"
+    environment:
+      # Server-side URLs (internal Docker network) - used by proxy routes
+      - MERCHANT_API_URL=http://merchant:8000
+      - PSP_API_URL=http://psp:8001
+      - PHOENIX_API_URL=${PHOENIX_API_URL:-http://phoenix:6006}
+      - NEXT_PUBLIC_UCP_PLATFORM_PROFILE_URL=${NEXT_PUBLIC_UCP_PLATFORM_PROFILE_URL:-http://merchant:8000/.well-known/ucp}
+      # Server-side API keys (NOT exposed to browser) - used by proxy routes
+      - MERCHANT_API_KEY=${MERCHANT_API_KEY:-merchant-api-key-12345}
+      - PSP_API_KEY=${PSP_API_KEY:-psp-api-key-12345}
+      # Webhook secret must match merchant's WEBHOOK_SECRET for signature verification
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-whsec_demo_secret}
+    networks:
+      - acp-network
+      - acp-infra-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # NAT AGENTS (all share the same base image)
+  # =============================================================================
+
+  # Promotion Agent (Port 8002) - Builds the shared agent image
+  promotion-agent:
+    build:
+      context: .
+      dockerfile: src/agents/Dockerfile
+    image: nat-agents:latest
+    container_name: nat-promotion-agent
+    command: nat serve --config_file configs/promotion.yml --host 0.0.0.0 --port 8002
+    expose:
+      - "8002"
+    environment:
+      - VYAPAAR_LLM_API_KEY=${VYAPAAR_LLM_API_KEY}
+      - PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces
+      # NIM Configuration - defaults to public VyapaarOS API endpoints
+      # For local NIM: set NIM_LLM_BASE_URL=http://nemotron-nano:8000/v1
+      #                    NIM_LLM_MODEL_NAME=vyapaaros/nemotron-3-nano
+      - NIM_LLM_BASE_URL=${NIM_LLM_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_LLM_MODEL_NAME=${NIM_LLM_MODEL_NAME:-nvidia/nemotron-3-nano-30b-a3b}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    networks:
+      - acp-network
+      - acp-infra-network
+    restart: unless-stopped
+
+  # Post-Purchase Agent (Port 8003) - Uses shared image
+  post-purchase-agent:
+    image: nat-agents:latest
+    container_name: nat-post-purchase-agent
+    command: nat serve --config_file configs/post-purchase.yml --host 0.0.0.0 --port 8003
+    expose:
+      - "8003"
+    environment:
+      - VYAPAAR_LLM_API_KEY=${VYAPAAR_LLM_API_KEY}
+      - PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces
+      # NIM Configuration
+      - NIM_LLM_BASE_URL=${NIM_LLM_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_LLM_MODEL_NAME=${NIM_LLM_MODEL_NAME:-nvidia/nemotron-3-nano-30b-a3b}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      promotion-agent:
+        condition: service_started
+    networks:
+      - acp-network
+      - acp-infra-network
+    restart: unless-stopped
+
+  # Recommendation Agent (Port 8004) - Uses shared image, requires Milvus
+  recommendation-agent:
+    image: nat-agents:latest
+    container_name: nat-recommendation-agent
+    command: nat serve --config_file configs/recommendation.yml --host 0.0.0.0 --port 8004
+    expose:
+      - "8004"
+    environment:
+      - VYAPAAR_LLM_API_KEY=${VYAPAAR_LLM_API_KEY}
+      - MILVUS_URI=http://milvus-standalone:19530
+      - PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces
+      # NIM Configuration (LLM and Embeddings)
+      - NIM_LLM_BASE_URL=${NIM_LLM_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_LLM_MODEL_NAME=${NIM_LLM_MODEL_NAME:-nvidia/nemotron-3-nano-30b-a3b}
+      - NIM_EMBED_BASE_URL=${NIM_EMBED_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_EMBED_MODEL_NAME=${NIM_EMBED_MODEL_NAME:-nvidia/nv-embedqa-e5-v5}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      promotion-agent:
+        condition: service_started
+    networks:
+      - acp-network
+      - acp-infra-network
+    restart: unless-stopped
+
+  # Search Agent (Port 8005) - Uses shared image, requires Milvus for RAG
+  search-agent:
+    image: nat-agents:latest
+    container_name: nat-search-agent
+    command: nat serve --config_file configs/search.yml --host 0.0.0.0 --port 8005
+    expose:
+      - "8005"
+    environment:
+      - VYAPAAR_LLM_API_KEY=${VYAPAAR_LLM_API_KEY}
+      - MILVUS_URI=http://milvus-standalone:19530
+      - PHOENIX_ENDPOINT=http://phoenix:6006/v1/traces
+      # NIM Configuration (LLM and Embeddings)
+      - NIM_LLM_BASE_URL=${NIM_LLM_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_LLM_MODEL_NAME=${NIM_LLM_MODEL_NAME:-nvidia/nemotron-3-nano-30b-a3b}
+      - NIM_EMBED_BASE_URL=${NIM_EMBED_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_EMBED_MODEL_NAME=${NIM_EMBED_MODEL_NAME:-nvidia/nv-embedqa-e5-v5}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      promotion-agent:
+        condition: service_started
+    networks:
+      - acp-network
+      - acp-infra-network
+    restart: unless-stopped
+
+  # =============================================================================
+  # MILVUS SEEDER (one-shot initialization)
+  # =============================================================================
+
+  # Milvus Seeder - Seeds product catalog embeddings into Milvus
+  # Runs once on startup, skips if already seeded
+  milvus-seeder:
+    image: nat-agents:latest
+    container_name: milvus-seeder
+    command: python scripts/seed_milvus.py
+    environment:
+      - VYAPAAR_LLM_API_KEY=${VYAPAAR_LLM_API_KEY}
+      - MILVUS_URI=http://milvus-standalone:19530
+      # NIM Embedding Configuration - defaults to public VyapaarOS API endpoint
+      # For local NIM: set NIM_EMBED_BASE_URL=http://embedqa:8000/v1
+      - NIM_EMBED_BASE_URL=${NIM_EMBED_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      - NIM_EMBED_MODEL_NAME=${NIM_EMBED_MODEL_NAME:-nvidia/nv-embedqa-e5-v5}
+      # Set to "true" to force re-seeding even if data exists
+      # - FORCE_RESEED=false
+    depends_on:
+      promotion-agent:
+        condition: service_started
+    networks:
+      - acp-infra-network
+    restart: "no"
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  acp-network:
+    driver: bridge
+  # External network created by docker-compose.infra.yml
+  acp-infra-network:
+    external: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  acp-data:
+    name: acp-data
