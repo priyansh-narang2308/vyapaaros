@@ -1,0 +1,889 @@
+"use client";
+
+import { useState } from "react";
+import { Bot } from "@/components/icons";
+import type {
+  AgentActivityEvent,
+  PromotionInputSignals,
+  PromotionDecision,
+  PostPurchaseInputSignals,
+  PostPurchaseDecision,
+  RecommendationInputSignals,
+  RecommendationDecision,
+  SearchInputSignals,
+  SearchDecision,
+} from "@/types";
+
+function isPromotionEvent(event: AgentActivityEvent): event is AgentActivityEvent & {
+  inputSignals: PromotionInputSignals;
+  decision?: PromotionDecision;
+} {
+  return event.agentType === "promotion";
+}
+
+function isPostPurchaseEvent(event: AgentActivityEvent): event is AgentActivityEvent & {
+  inputSignals: PostPurchaseInputSignals;
+  decision?: PostPurchaseDecision;
+} {
+  return event.agentType === "post_purchase";
+}
+
+function isRecommendationEvent(event: AgentActivityEvent): event is AgentActivityEvent & {
+  inputSignals: RecommendationInputSignals;
+  decision?: RecommendationDecision;
+} {
+  return event.agentType === "recommendation";
+}
+
+function isSearchEvent(event: AgentActivityEvent): event is AgentActivityEvent & {
+  inputSignals: SearchInputSignals;
+  decision?: SearchDecision;
+} {
+  return event.agentType === "search";
+}
+
+function getActionInfo(action: string): {
+  label: string;
+  percentage: number;
+  shortLabel: string;
+} {
+  switch (action) {
+    case "DISCOUNT_5_PCT":
+      return { label: "5% discount applied", percentage: 5, shortLabel: "5% off" };
+    case "DISCOUNT_10_PCT":
+      return { label: "10% discount applied", percentage: 10, shortLabel: "10% off" };
+    case "DISCOUNT_15_PCT":
+      return { label: "15% discount applied", percentage: 15, shortLabel: "15% off" };
+    case "FREE_SHIPPING":
+      return { label: "Free shipping applied", percentage: 0, shortLabel: "Free shipping" };
+    case "NO_PROMO":
+      return { label: "No promotion applied", percentage: 0, shortLabel: "No discount" };
+    default:
+      return { label: action, percentage: 0, shortLabel: action };
+  }
+}
+
+function getOutcomeInfo(
+  action: string,
+  amount: number
+): {
+  label: string;
+  valueText: string;
+  isPositive: boolean;
+  actionInfo: ReturnType<typeof getActionInfo>;
+} {
+  const formattedAmount = `$${(amount / 100).toFixed(2)}`;
+  const actionInfo = getActionInfo(action);
+
+  switch (action) {
+    case "DISCOUNT_5_PCT":
+    case "DISCOUNT_10_PCT":
+    case "DISCOUNT_15_PCT":
+      return {
+        label: `${actionInfo.label} based on current checkout context.`,
+        valueText: `−${formattedAmount}`,
+        isPositive: true,
+        actionInfo,
+      };
+    case "FREE_SHIPPING":
+      return { label: "Free shipping applied", valueText: "Free", isPositive: true, actionInfo };
+    case "NO_PROMO":
+      return {
+        label: "No promotion discount was applied.",
+        valueText: "$0.00",
+        isPositive: false,
+        actionInfo,
+      };
+    default:
+      if (amount > 0) {
+        return {
+          label: "Promotion discount applied.",
+          valueText: `−${formattedAmount}`,
+          isPositive: true,
+          actionInfo,
+        };
+      }
+      return {
+        label: "Promotion decision metadata unavailable.",
+        valueText: "$0.00",
+        isPositive: false,
+        actionInfo,
+      };
+  }
+}
+
+function formatDuration(ms: number | undefined): string {
+  if (ms === undefined) return "—";
+  return `${ms} ms`;
+}
+
+function formatCurrency(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+interface AgentActivityItemProps {
+  event: AgentActivityEvent;
+  isLast: boolean;
+}
+
+function PostPurchaseCard({
+  event,
+  isLast,
+}: {
+  event: AgentActivityEvent & {
+    inputSignals: PostPurchaseInputSignals;
+    decision?: PostPurchaseDecision;
+  };
+  isLast: boolean;
+}) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const isPending = event.status === "pending";
+  const isError = event.status === "error";
+  const isSuccess = event.status === "success" && event.decision;
+
+  const toggleExpanded = () => setIsExpanded(!isExpanded);
+
+  return (
+    <div style={{ marginBottom: isLast ? 0 : "12px" }}>
+      <div className={`glass-decision ${isSuccess ? "highlight" : ""}`}>
+        {}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: "12px",
+          }}
+        >
+          <div
+            className="glass-kicker"
+            style={{ display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            {}
+            <span
+              style={{
+                width: "24px",
+                height: "24px",
+                borderRadius: "6px",
+                background: isPending
+                  ? "rgba(255, 255, 255, 0.08)"
+                  : isError
+                    ? "rgba(255, 107, 107, 0.15)"
+                    : "rgba(118, 185, 0, 0.15)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
+              <Bot
+                style={{
+                  width: "14px",
+                  height: "14px",
+                  color: isPending
+                    ? "rgba(255, 255, 255, 0.5)"
+                    : isError
+                      ? "#FF6B6B"
+                      : "rgba(118, 185, 0, 0.9)",
+                }}
+              />
+            </span>
+            Post-Purchase Agent
+          </div>
+          <div className={`glass-pill ${isPending ? "yellow" : isError ? "" : "green"}`}>
+            {isPending ? "Generating" : isError ? "Error" : "Sent"}
+          </div>
+        </div>
+
+        {}
+        <div
+          style={{
+            marginTop: "8px",
+            fontSize: "13px",
+            color: "var(--text-secondary)",
+            fontWeight: "650",
+          }}
+        >
+          {event.inputSignals.productName}
+        </div>
+
+        {}
+        {event.decision && (
+          <div
+            style={{
+              marginTop: "10px",
+              color: "var(--text-primary)",
+              fontSize: "13px",
+              fontWeight: "600",
+              lineHeight: "1.35",
+            }}
+          >
+            {event.decision.subject}
+          </div>
+        )}
+
+        {}
+        {event.decision && (
+          <div
+            style={{
+              marginTop: "8px",
+              color: "var(--text-muted)",
+              fontSize: "12px",
+              lineHeight: "1.45",
+              whiteSpace: "pre-wrap",
+              maxHeight: isExpanded ? "none" : "60px",
+              overflow: "hidden",
+            }}
+          >
+            {event.decision.message}
+          </div>
+        )}
+
+        {isPending && (
+          <div style={{ color: "var(--text-muted)", fontSize: "12px", marginTop: "10px" }}>
+            Generating personalized confirmation message...
+          </div>
+        )}
+
+        {}
+        {isError && event.error && (
+          <div
+            style={{
+              marginTop: "12px",
+              padding: "10px 12px",
+              borderRadius: "14px",
+              border: "1px solid rgba(255, 107, 107, 0.25)",
+              background: "rgba(255, 107, 107, 0.08)",
+              fontSize: "12px",
+              color: "#FF6B6B",
+            }}
+          >
+            {event.error}
+          </div>
+        )}
+
+        {}
+        {!isPending && event.decision && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              alignItems: "center",
+              marginTop: "12px",
+            }}
+          >
+            <button
+              className="glass-details-toggle"
+              onClick={toggleExpanded}
+              aria-expanded={isExpanded}
+              type="button"
+            >
+              <span className="glass-chevron"></span>
+              <span>{isExpanded ? "Less" : "More"}</span>
+            </button>
+          </div>
+        )}
+
+        {}
+        {isExpanded && !isPending && event.decision && (
+          <div className="glass-details" style={{ display: "block" }}>
+            <div className="glass-kv">
+              <div className="k">Order ID</div>
+              <div className="v">{event.inputSignals.orderId}</div>
+              <div className="k">Customer</div>
+              <div className="v">{event.inputSignals.customerName}</div>
+              <div className="k">Status</div>
+              <div className="v" style={{ textTransform: "capitalize" }}>
+                {event.inputSignals.status.replace(/_/g, " ")}
+              </div>
+              <div className="k">Tone</div>
+              <div className="v" style={{ textTransform: "capitalize" }}>
+                {event.inputSignals.tone}
+              </div>
+              <div className="k">Language</div>
+              <div className="v" style={{ textTransform: "uppercase" }}>
+                {event.decision.language}
+              </div>
+              {event.duration !== undefined && (
+                <>
+                  <div className="k">Generation time</div>
+                  <div className="v">{formatDuration(event.duration)}</div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RecommendationCard({
+  event,
+  isLast,
+}: {
+  event: AgentActivityEvent & {
+    inputSignals: RecommendationInputSignals;
+    decision?: RecommendationDecision;
+  };
+  isLast: boolean;
+}) {
+  const isPending = event.status === "pending";
+  const isError = event.status === "error";
+  const isSuccess = event.status === "success" && event.decision;
+
+  const recommendationCount = event.decision?.recommendations?.length ?? 0;
+
+  return (
+    <div style={{ marginBottom: isLast ? 0 : "12px" }}>
+      <div className={`glass-decision ${isSuccess ? "highlight" : ""}`}>
+        {}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: "12px",
+          }}
+        >
+          <div
+            className="glass-kicker"
+            style={{ display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            {}
+            <span
+              style={{
+                width: "24px",
+                height: "24px",
+                borderRadius: "6px",
+                background: isPending
+                  ? "rgba(255, 255, 255, 0.08)"
+                  : isError
+                    ? "rgba(255, 107, 107, 0.15)"
+                    : "rgba(118, 185, 0, 0.15)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
+              <Bot
+                style={{
+                  width: "14px",
+                  height: "14px",
+                  color: isPending
+                    ? "rgba(255, 255, 255, 0.5)"
+                    : isError
+                      ? "#FF6B6B"
+                      : "rgba(118, 185, 0, 0.9)",
+                }}
+              />
+            </span>
+            Recommendation Agent
+          </div>
+          <div className={`glass-pill ${isPending ? "yellow" : isError ? "" : "green"}`}>
+            {isPending ? "Generating" : isError ? "Error" : `${recommendationCount} items`}
+          </div>
+        </div>
+
+        {}
+        <div
+          style={{
+            marginTop: "8px",
+            fontSize: "13px",
+            color: "var(--text-secondary)",
+            fontWeight: "650",
+          }}
+        >
+          {event.inputSignals.productName}
+        </div>
+
+        {}
+        {event.decision?.userIntent && (
+          <div
+            style={{
+              marginTop: "10px",
+              color: "var(--text-muted)",
+              fontSize: "12px",
+              lineHeight: "1.35",
+            }}
+          >
+            {event.decision.userIntent}
+          </div>
+        )}
+
+        {}
+        {event.decision?.recommendations && event.decision.recommendations.length > 0 && (
+          <div style={{ marginTop: "12px" }}>
+            {event.decision.recommendations.map((rec, index) => (
+              <div
+                key={rec.productId}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  padding: "8px 0",
+                  borderTop: index === 0 ? "none" : "1px solid rgba(255, 255, 255, 0.06)",
+                }}
+              >
+                <span
+                  style={{
+                    width: "20px",
+                    height: "20px",
+                    borderRadius: "50%",
+                    background: "rgba(118, 185, 0, 0.15)",
+                    color: "rgba(118, 185, 0, 0.9)",
+                    fontSize: "11px",
+                    fontWeight: "600",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  {rec.rank}
+                </span>
+                <div style={{ flex: 1 }}>
+                  <div
+                    style={{ fontSize: "12px", fontWeight: "500", color: "var(--text-primary)" }}
+                  >
+                    {rec.productName}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: "11px",
+                      color: "var(--text-muted)",
+                      marginTop: "2px",
+                      lineHeight: "1.3",
+                    }}
+                  >
+                    {rec.reasoning}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {isPending && (
+          <div style={{ color: "var(--text-muted)", fontSize: "12px", marginTop: "10px" }}>
+            Generating personalized recommendations...
+          </div>
+        )}
+
+        {}
+        {isError && event.error && (
+          <div
+            style={{
+              marginTop: "12px",
+              padding: "10px 12px",
+              borderRadius: "14px",
+              border: "1px solid rgba(255, 107, 107, 0.25)",
+              background: "rgba(255, 107, 107, 0.08)",
+              fontSize: "12px",
+              color: "#FF6B6B",
+            }}
+          >
+            {event.error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SearchCard({
+  event,
+  isLast,
+}: {
+  event: AgentActivityEvent & {
+    inputSignals: SearchInputSignals;
+    decision?: SearchDecision;
+  };
+  isLast: boolean;
+}) {
+  const isPending = event.status === "pending";
+  const isError = event.status === "error";
+  const resultCount = event.decision?.results?.length ?? 0;
+  const totalResults = event.decision?.totalResults ?? resultCount;
+
+  return (
+    <div style={{ marginBottom: isLast ? 0 : "12px" }}>
+      <div className="glass-decision">
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: "12px",
+          }}
+        >
+          <div
+            className="glass-kicker"
+            style={{ display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            <span
+              style={{
+                width: "24px",
+                height: "24px",
+                borderRadius: "6px",
+                background: isPending
+                  ? "rgba(255, 255, 255, 0.08)"
+                  : isError
+                    ? "rgba(255, 107, 107, 0.15)"
+                    : "rgba(118, 185, 0, 0.15)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
+              <Bot
+                style={{
+                  width: "14px",
+                  height: "14px",
+                  color: isPending
+                    ? "rgba(255, 255, 255, 0.5)"
+                    : isError
+                      ? "#FF6B6B"
+                      : "rgba(118, 185, 0, 0.9)",
+                }}
+              />
+            </span>
+            Search Agent
+          </div>
+          <div className={`glass-pill ${isPending ? "yellow" : isError ? "" : "green"}`}>
+            {isPending ? "Searching" : isError ? "Error" : `${resultCount} items`}
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: "8px",
+            fontSize: "13px",
+            color: "var(--text-secondary)",
+            fontWeight: "650",
+          }}
+        >
+          {event.inputSignals.query}
+        </div>
+
+        {event.decision?.results && event.decision.results.length > 0 && (
+          <div style={{ marginTop: "10px" }}>
+            {event.decision.results.map((result, index) => (
+              <div
+                key={result.productId}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  padding: "6px 0",
+                  borderTop: index === 0 ? "none" : "1px solid rgba(255, 255, 255, 0.06)",
+                }}
+              >
+                <span
+                  style={{
+                    width: "20px",
+                    height: "20px",
+                    borderRadius: "50%",
+                    background: "rgba(118, 185, 0, 0.15)",
+                    color: "rgba(118, 185, 0, 0.9)",
+                    fontSize: "11px",
+                    fontWeight: "600",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                  }}
+                >
+                  {index + 1}
+                </span>
+                <div style={{ flex: 1 }}>
+                  <div
+                    style={{ fontSize: "12px", fontWeight: "500", color: "var(--text-primary)" }}
+                  >
+                    {result.productName}
+                  </div>
+                </div>
+              </div>
+            ))}
+            {totalResults > resultCount && (
+              <div style={{ marginTop: "8px", fontSize: "11px", color: "var(--text-muted)" }}>
+                {totalResults} total matches
+              </div>
+            )}
+          </div>
+        )}
+
+        {isPending && (
+          <div style={{ color: "var(--text-muted)", fontSize: "12px", marginTop: "10px" }}>
+            Searching catalog for matching products...
+          </div>
+        )}
+
+        {isError && event.error && (
+          <div
+            style={{
+              marginTop: "12px",
+              padding: "10px 12px",
+              borderRadius: "14px",
+              border: "1px solid rgba(255, 107, 107, 0.25)",
+              background: "rgba(255, 107, 107, 0.08)",
+              fontSize: "12px",
+              color: "#FF6B6B",
+            }}
+          >
+            {event.error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function AgentActivityItem({ event, isLast }: AgentActivityItemProps) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const isPending = event.status === "pending";
+  const isError = event.status === "error";
+
+  
+  if (isPostPurchaseEvent(event)) {
+    return <PostPurchaseCard event={event} isLast={isLast} />;
+  }
+
+  
+  if (isRecommendationEvent(event)) {
+    return <RecommendationCard event={event} isLast={isLast} />;
+  }
+
+  if (isSearchEvent(event)) {
+    return <SearchCard event={event} isLast={isLast} />;
+  }
+
+  
+  if (!isPromotionEvent(event)) {
+    return null;
+  }
+
+  const toggleExpanded = () => setIsExpanded(!isExpanded);
+
+  
+  const outcomeInfo = event.decision
+    ? getOutcomeInfo(event.decision.action, event.decision.discountAmount)
+    : null;
+
+  
+  const llmReasoning = event.decision?.reasoning;
+
+  
+  const isHighlight = outcomeInfo?.isPositive && !isError && !isPending;
+
+  return (
+    <div style={{ marginBottom: isLast ? 0 : "12px" }}>
+      {}
+      <div className={`glass-decision ${isHighlight ? "highlight" : ""}`}>
+        {}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: "12px",
+          }}
+        >
+          <div
+            className="glass-kicker"
+            style={{ display: "flex", alignItems: "center", gap: "8px" }}
+          >
+            {}
+            <span
+              style={{
+                width: "24px",
+                height: "24px",
+                borderRadius: "6px",
+                background: isPending
+                  ? "rgba(255, 255, 255, 0.08)"
+                  : isError
+                    ? "rgba(255, 107, 107, 0.15)"
+                    : "rgba(118, 185, 0, 0.15)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}
+            >
+              <Bot
+                style={{
+                  width: "14px",
+                  height: "14px",
+                  color: isPending
+                    ? "rgba(255, 255, 255, 0.5)"
+                    : isError
+                      ? "#FF6B6B"
+                      : "rgba(118, 185, 0, 0.9)",
+                }}
+              />
+            </span>
+            Promotion Agent
+          </div>
+          <div
+            className={`glass-pill ${isPending ? "yellow" : isError ? "" : outcomeInfo?.isPositive ? "green" : ""}`}
+          >
+            {isPending
+              ? "Evaluating"
+              : isError
+                ? "Error"
+                : outcomeInfo?.isPositive
+                  ? "Applied"
+                  : "No change"}
+          </div>
+        </div>
+
+        {}
+        <div
+          style={{
+            marginTop: "8px",
+            fontSize: "13px",
+            color: "var(--text-secondary)",
+            fontWeight: "650",
+          }}
+        >
+          {event.inputSignals.productName}
+        </div>
+
+        {}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "baseline",
+            marginTop: "10px",
+            gap: "12px",
+          }}
+        >
+          <div style={{ color: "var(--text-muted)", fontSize: "12px", lineHeight: "1.35" }}>
+            {isPending
+              ? "Gathering context from the cart, inventory, and market signals…"
+              : outcomeInfo?.label || "Processing..."}
+          </div>
+          <div className={`glass-value ${outcomeInfo?.isPositive ? "positive" : ""}`}>
+            {outcomeInfo?.valueText || "$0.00"}
+          </div>
+        </div>
+
+        {}
+        {llmReasoning && !isPending && !isError && (
+          <div className="glass-section">
+            <h3>Agent&apos;s reasoning</h3>
+            <p
+              style={{
+                margin: 0,
+                color: "var(--text-secondary)",
+                fontSize: "12px",
+                lineHeight: "1.45",
+              }}
+            >
+              {llmReasoning}
+            </p>
+          </div>
+        )}
+
+        {}
+        {isError && event.error && (
+          <div
+            style={{
+              marginTop: "12px",
+              padding: "10px 12px",
+              borderRadius: "14px",
+              border: "1px solid rgba(255, 107, 107, 0.25)",
+              background: "rgba(255, 107, 107, 0.08)",
+              fontSize: "12px",
+              color: "#FF6B6B",
+            }}
+          >
+            {event.error}
+          </div>
+        )}
+
+        {}
+        {!isPending && (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              alignItems: "center",
+              marginTop: "12px",
+            }}
+          >
+            <button
+              className="glass-details-toggle"
+              onClick={toggleExpanded}
+              aria-expanded={isExpanded}
+              type="button"
+            >
+              <span className="glass-chevron"></span>
+              <span>Details</span>
+            </button>
+          </div>
+        )}
+
+        {}
+        {isExpanded && !isPending && (
+          <div className="glass-details" style={{ display: "block" }}>
+            <div className="glass-kv">
+              <div className="k">Stock level</div>
+              <div className="v">{event.inputSignals.stockCount} units</div>
+              <div className="k">Base price</div>
+              <div className="v">{formatCurrency(event.inputSignals.basePrice)}</div>
+              {event.inputSignals.competitorPrice && (
+                <>
+                  <div className="k">Market reference</div>
+                  <div className="v">{formatCurrency(event.inputSignals.competitorPrice)}</div>
+                </>
+              )}
+              <div className="k">Inventory state</div>
+              <div className="v">
+                {event.inputSignals.inventoryPressure === "high" ? "High" : "Normal"}
+              </div>
+              <div className="k">Price position</div>
+              <div className="v">
+                {event.inputSignals.competitionPosition === "above_market"
+                  ? "Above market"
+                  : event.inputSignals.competitionPosition === "below_market"
+                    ? "Below market"
+                    : event.inputSignals.competitionPosition === "at_market"
+                      ? "At market"
+                      : "Unknown"}
+              </div>
+              <div className="k">Seasonal urgency</div>
+              <div className="v" style={{ textTransform: "capitalize" }}>
+                {event.inputSignals.seasonalUrgency?.replace(/_/g, " ") ?? "Unknown"}
+              </div>
+              <div className="k">Product lifecycle</div>
+              <div className="v" style={{ textTransform: "capitalize" }}>
+                {event.inputSignals.productLifecycle?.replace(/_/g, " ") ?? "Unknown"}
+              </div>
+              <div className="k">Demand velocity</div>
+              <div className="v" style={{ textTransform: "capitalize" }}>
+                {event.inputSignals.demandVelocity ?? "Unknown"}
+              </div>
+              {event.duration !== undefined && (
+                <>
+                  <div className="k">Time to decide</div>
+                  <div className="v">{formatDuration(event.duration)}</div>
+                </>
+              )}
+            </div>
+            {event.decision?.reasonCodes && event.decision.reasonCodes.length > 0 && (
+              <>
+                <div className="glass-divider"></div>
+                <div style={{ color: "var(--text-muted)", fontSize: "12px" }}>
+                  <span style={{ fontWeight: "500" }}>Reason codes: </span>
+                  {event.decision.reasonCodes.join(", ")}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

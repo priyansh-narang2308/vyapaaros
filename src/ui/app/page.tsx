@@ -1,0 +1,112 @@
+"use client";
+
+import { useState } from "react";
+import { Navbar, PanelDivider } from "@/components/layout";
+import { AgentPanel } from "@/components/agent";
+import { BusinessPanel } from "@/components/business";
+import { AgentActivityPanel } from "@/components/agent-activity";
+import { WebhookToAgentActivityBridge } from "@/components/WebhookToAgentActivityBridge";
+import { ACPLogProvider } from "@/hooks/useACPLog";
+import { AgentActivityLogProvider } from "@/hooks/useAgentActivityLog";
+import { Nebula } from "@/kui-foundations-react-external/nebula";
+import type { CheckoutProtocol } from "@/types";
+
+export default function Home() {
+  const [protocol, setProtocol] = useState<CheckoutProtocol>("acp");
+
+  return (
+    <ACPLogProvider>
+      <AgentActivityLogProvider>
+        <WebhookToAgentActivityBridge />
+        <div className="min-h-screen h-screen bg-surface-base relative overflow-hidden">
+          {}
+          <div
+            className="pointer-events-none"
+            style={{
+              position: "fixed",
+              top: 0,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              width: "100vw",
+              height: "100vh",
+              zIndex: 0,
+              overflow: "hidden",
+            }}
+          >
+            <div style={{ width: "100%", height: "100%" }}>
+              <Nebula variant="ambient" />
+            </div>
+          </div>
+
+          {}
+          <div
+            className="pointer-events-none"
+            style={{
+              position: "fixed",
+              top: 0,
+              left: 0,
+              right: 0,
+              height: "500px",
+              background: "linear-gradient(80.22deg, #BFF230 1.49%, #7CD7FE 99.95%)",
+              opacity: 0.12,
+              zIndex: 0,
+              maskImage:
+                "radial-gradient(ellipse 150% 120% at top, black 0%, black 30%, transparent 70%)",
+              WebkitMaskImage:
+                "radial-gradient(ellipse 150% 120% at top, black 0%, black 30%, transparent 70%)",
+            }}
+          />
+
+          {}
+          <div
+            className="pointer-events-none"
+            style={{
+              position: "fixed",
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: "300px",
+              background: "linear-gradient(80.22deg, #BFF230 1.49%, #7CD7FE 99.95%)",
+              opacity: 0.12,
+              zIndex: 0,
+              maskImage:
+                "radial-gradient(ellipse 120% 130% at bottom, black 0%, black 25%, transparent 60%)",
+              WebkitMaskImage:
+                "radial-gradient(ellipse 120% 130% at bottom, black 0%, black 25%, transparent 60%)",
+            }}
+          />
+
+          {}
+          <div className="relative flex flex-col h-full" style={{ zIndex: 1 }}>
+            <Navbar />
+            {}
+            <div className="flex-1 flex flex-col min-h-0" style={{ padding: "24px 40px" }}>
+              <main
+                className="flex-1 flex items-stretch w-full h-full min-h-0"
+                style={{ gap: "32px" }}
+              >
+                {}
+                <div className="flex-1 flex min-w-0">
+                  <AgentPanel protocol={protocol} />
+                </div>
+
+                <PanelDivider />
+
+                {}
+                <div className="flex-1 flex min-w-0">
+                  <BusinessPanel protocol={protocol} onProtocolChange={setProtocol} />
+                </div>
+
+                {}
+                <div className="flex-1 flex min-w-0">
+                  <AgentActivityPanel />
+                </div>
+              </main>
+            </div>
+          </div>
+        </div>
+      </AgentActivityLogProvider>
+    </ACPLogProvider>
+  );
+}
