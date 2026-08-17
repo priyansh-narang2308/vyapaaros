@@ -1,0 +1,279 @@
+"use client";
+
+import { useEffect, useCallback, useRef } from "react";
+import { useACPLog, type ACPEventType } from "./useACPLog";
+import { useAgentActivityLog } from "./useAgentActivityLog";
+import type {
+  PromotionInputSignals,
+  PromotionDecision,
+  RecommendationInputSignals,
+  RecommendationDecision,
+  RecommendationItem,
+  RecommendationPipelineTrace,
+} from "@/types";
+
+interface CheckoutSSEEvent {
+  id: string;
+  type: string;
+  endpoint: string;
+  method: string;
+  status: string;
+  summary?: string;
+  statusCode?: number;
+  sessionId?: string;
+  orderId?: string;
+  timestamp: string;
+}
+
+interface PromotionActivitySSEEvent {
+  id: string;
+  agentType: "promotion";
+  productId: string;
+  productName: string;
+  action: string;
+  discountAmount: number;
+  reasonCodes: string[];
+  reasoning: string;
+  stockCount: number;
+  basePrice: number;
+  signals?: Record<string, string>;
+  timestamp: string;
+}
+
+interface RecommendationActivitySSEEvent {
+  id: string;
+  agentType: "recommendation";
+  status: "pending" | "success" | "error";
+  productId: string;
+  productName: string;
+  cartItems: Array<{ productId: string; name: string; price: number }>;
+  
+  recommendations?: Array<{
+    productId: string;
+    productName: string;
+    rank: number;
+    reasoning: string;
+  }>;
+  userIntent?: string;
+  pipelineTrace?: {
+    candidatesFound?: number;
+    afterNliFilter?: number;
+    finalRanked?: number;
+  };
+  recommendationRequestId?: string;
+  latencyMs?: number;
+  error?: string;
+  timestamp: string;
+}
+
+type AgentActivitySSEEvent = PromotionActivitySSEEvent | RecommendationActivitySSEEvent;
+
+
+
+
+
+function buildPromotionSignals(data: PromotionActivitySSEEvent): {
+  inputSignals: PromotionInputSignals;
+  decision: PromotionDecision;
+} {
+  const signals = data.signals;
+  return {
+    inputSignals: {
+      productId: data.productId,
+      productName: data.productName,
+      stockCount: data.stockCount,
+      basePrice: data.basePrice,
+      competitorPrice: null,
+      inventoryPressure:
+        (signals?.inventory_pressure as "high" | "low") ?? (data.stockCount > 50 ? "high" : "low"),
+      competitionPosition:
+        (signals?.competition_position as PromotionInputSignals["competitionPosition"]) ??
+        inferCompetitionPosition(data.reasonCodes),
+      seasonalUrgency: signals?.seasonal_urgency ?? "off_season",
+      productLifecycle: signals?.product_lifecycle ?? "mature",
+      demandVelocity: signals?.demand_velocity ?? "flat",
+    },
+    decision: {
+      action: data.action,
+      discountAmount: data.discountAmount,
+      reasonCodes: data.reasonCodes,
+      reasoning: data.reasoning,
+    },
+  };
+}
+
+function buildRecommendationDecision(data: RecommendationActivitySSEEvent): RecommendationDecision {
+  const recommendations: RecommendationItem[] = (data.recommendations ?? []).map((rec) => ({
+    productId: rec.productId ?? "",
+    productName: rec.productName ?? "",
+    rank: rec.rank,
+    reasoning: rec.reasoning,
+  }));
+
+  const pipelineTrace: RecommendationPipelineTrace | undefined = data.pipelineTrace
+    ? {
+        candidatesFound: data.pipelineTrace.candidatesFound ?? 0,
+        afterNliFilter: data.pipelineTrace.afterNliFilter ?? 0,
+        finalRanked: data.pipelineTrace.finalRanked ?? 0,
+      }
+    : undefined;
+
+  return {
+    recommendations,
+    ...(data.userIntent !== undefined && { userIntent: data.userIntent }),
+    ...(pipelineTrace !== undefined && { pipelineTrace }),
+  };
+}
+
+/**
+ * Map SSE event type to ACP log event type
+ */
+function mapEventType(type: string): ACPEventType {
+  switch (type) {
+    case "session_create":
+      return "session_create";
+    case "session_update":
+      return "session_update";
+    case "delegate_payment":
+      return "delegate_payment";
+    case "session_complete":
+      return "session_complete";
+    default:
+      return "session_update";
+  }
+}
+
+const MCP_SERVER_URL = process.env.NEXT_PUBLIC_MCP_SERVER_URL || "http://localhost:2091";
+
+export function useCheckoutEvents(mcpServerUrl = MCP_SERVER_URL) {
+  const { logEvent, completeEvent } = useACPLog();
+  const { addAgentEvent, logAgentCall, completeAgentCall } = useAgentActivityLog();
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const pendingEventsRef = useRef<Map<string, string>>(new Map());
+
+  const handleCheckoutEvent = useCallback(
+    (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data) as CheckoutSSEEvent;
+        const acpType = mapEventType(data.type);
+
+        if (data.status === "pending") {
+          
+          const eventId = logEvent(
+            acpType,
+            (data.method as "POST" | "GET" | "PUT") || "POST",
+            data.endpoint,
+            data.summary
+          );
+          
+          pendingEventsRef.current.set(data.id, eventId);
+        } else {
+          
+          const pendingEventId = pendingEventsRef.current.get(data.id);
+          if (pendingEventId) {
+            completeEvent(
+              pendingEventId,
+              data.status === "success" ? "success" : "error",
+              data.summary,
+              data.statusCode
+            );
+            pendingEventsRef.current.delete(data.id);
+          } else {
+            
+            const eventId = logEvent(
+              acpType,
+              (data.method as "POST" | "GET" | "PUT") || "POST",
+              data.endpoint,
+              data.summary
+            );
+            completeEvent(
+              eventId,
+              data.status === "success" ? "success" : "error",
+              data.summary,
+              data.statusCode
+            );
+          }
+        }
+      } catch (error) {
+        console.error("[useCheckoutEvents] Failed to parse checkout event:", error);
+      }
+    },
+    [logEvent, completeEvent]
+  );
+
+  const handleAgentActivityEvent = useCallback(
+    (event: MessageEvent) => {
+      try {
+        const data = JSON.parse(event.data) as AgentActivitySSEEvent;
+
+        if (data.agentType === "promotion") {
+          const { inputSignals, decision } = buildPromotionSignals(data);
+          addAgentEvent("promotion", inputSignals, decision, "success");
+          return;
+        }
+
+        if (data.agentType !== "recommendation") return;
+
+        const recData = data;
+        const inputSignals: RecommendationInputSignals = {
+          productId: recData.productId,
+          productName: recData.productName,
+          cartItems: recData.cartItems ?? [],
+        };
+
+        if (recData.status === "pending") {
+          const localId = logAgentCall("recommendation", inputSignals);
+          pendingEventsRef.current.set(recData.id, localId);
+          return;
+        }
+
+        const decision = buildRecommendationDecision(recData);
+        const status = recData.error ? "error" : "success";
+        const pendingLocalId = pendingEventsRef.current.get(recData.id);
+
+        if (pendingLocalId) {
+          completeAgentCall(pendingLocalId, status, decision, recData.error);
+          pendingEventsRef.current.delete(recData.id);
+        } else {
+          const localId = logAgentCall("recommendation", inputSignals);
+          completeAgentCall(localId, status, decision, recData.error);
+        }
+      } catch (error) {
+        console.error("[useCheckoutEvents] Failed to parse agent activity event:", error);
+      }
+    },
+    [addAgentEvent, logAgentCall, completeAgentCall]
+  );
+
+  useEffect(() => {
+    
+    if (typeof EventSource === "undefined") {
+      return;
+    }
+
+    
+    const eventSource = new EventSource(`${mcpServerUrl}/events`);
+    eventSourceRef.current = eventSource;
+
+    eventSource.addEventListener("checkout", handleCheckoutEvent);
+    eventSource.addEventListener("agent_activity", handleAgentActivityEvent);
+
+    eventSource.onerror = () => {
+      
+    };
+
+    return () => {
+      eventSource.close();
+      eventSourceRef.current = null;
+    };
+  }, [mcpServerUrl, handleCheckoutEvent, handleAgentActivityEvent]);
+}
+
+function inferCompetitionPosition(
+  reasonCodes: string[]
+): "above_market" | "at_market" | "below_market" | "unknown" {
+  if (reasonCodes.includes("ABOVE_MARKET")) return "above_market";
+  if (reasonCodes.includes("BELOW_MARKET")) return "below_market";
+  if (reasonCodes.includes("AT_MARKET")) return "at_market";
+  return "unknown";
+}
