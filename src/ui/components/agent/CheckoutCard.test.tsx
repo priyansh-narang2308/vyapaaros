@@ -1,0 +1,319 @@
+import { describe, it, expect, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { CheckoutCard } from "./CheckoutCard";
+import type { Product } from "@/types";
+
+
+vi.mock("next/image", () => ({
+  default: ({ alt, ...props }: { alt: string }) => (
+    
+    <img alt={alt} {...props} />
+  ),
+}));
+
+describe("CheckoutCard", () => {
+  const mockCheckout = {
+    id: "checkout_123",
+    status: "ready_for_payment",
+    currency: "usd",
+    lineItems: [
+      {
+        id: "li_1",
+        item: {
+          id: "sku_1",
+          name: "Test Shirt",
+          imageUrl: "/prod_1.jpeg",
+        },
+        quantity: 1,
+        baseAmount: 2500,
+        discount: 0,
+        subtotal: 2500,
+        tax: 0,
+        total: 2500,
+      },
+    ],
+    subtotal: 2500,
+    discount: 0,
+    tax: 0,
+    shipping: 500,
+    total: 3000,
+    fulfillmentOptions: [
+      {
+        id: "shipping_standard",
+        name: "Standard",
+        description: "5-7 business days",
+        price: 500,
+        estimatedDelivery: "5-7 business days",
+      },
+      {
+        id: "shipping_express",
+        name: "Express",
+        description: "2-3 business days",
+        price: 1200,
+        estimatedDelivery: "2-3 business days",
+      },
+    ],
+    selectedFulfillmentOptionId: "shipping_standard",
+    paymentProvider: {
+      provider: "psp",
+      supportedPaymentMethods: ["card"],
+    },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const mockProduct: Product = {
+    id: "prod_1",
+    sku: "TS-001",
+    name: "Deluxe Shirt",
+    description: "Premium quality cotton t-shirt",
+    basePrice: 2500,
+    stockCount: 100,
+    minMargin: 0.15,
+    imageUrl: "/prod_2.jpeg",
+    variant: "Black",
+    size: "Large",
+  };
+
+  it("renders the brand name", () => {
+    render(<CheckoutCard checkout={mockCheckout} />);
+    expect(screen.getByText("NVShop")).toBeInTheDocument();
+  });
+
+  it("renders the line item name", () => {
+    render(<CheckoutCard checkout={mockCheckout} />);
+    expect(screen.getByText("Test Shirt")).toBeInTheDocument();
+  });
+
+  it("renders the total amount", () => {
+    render(<CheckoutCard checkout={mockCheckout} />);
+    expect(screen.getByText("$30.00")).toBeInTheDocument();
+  });
+
+  it("renders the subtotal", () => {
+    render(<CheckoutCard checkout={mockCheckout} />);
+    
+    const prices = screen.getAllByText("$25.00");
+    expect(prices.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("renders shipping cost", () => {
+    render(<CheckoutCard checkout={mockCheckout} />);
+    expect(screen.getByText("$5.00")).toBeInTheDocument();
+  });
+
+  it("renders continue button", () => {
+    render(<CheckoutCard checkout={mockCheckout} />);
+    expect(screen.getByRole("button", { name: /continue to payment/i })).toBeInTheDocument();
+  });
+
+  it("calls onContinue when continue button is clicked", () => {
+    const onContinue = vi.fn();
+    render(<CheckoutCard checkout={mockCheckout} onContinue={onContinue} />);
+
+    screen.getByRole("button", { name: /continue to payment/i }).click();
+
+    expect(onContinue).toHaveBeenCalled();
+  });
+
+  describe("quantity controls", () => {
+    it("renders quantity controls", () => {
+      render(<CheckoutCard checkout={mockCheckout} quantity={2} />);
+
+      expect(screen.getByRole("button", { name: /decrease quantity/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /increase quantity/i })).toBeInTheDocument();
+      expect(screen.getByText("2")).toBeInTheDocument();
+    });
+
+    it("calls onQuantityChange with decremented value when minus is clicked", () => {
+      const onQuantityChange = vi.fn();
+      render(
+        <CheckoutCard checkout={mockCheckout} quantity={3} onQuantityChange={onQuantityChange} />
+      );
+
+      screen.getByRole("button", { name: /decrease quantity/i }).click();
+
+      expect(onQuantityChange).toHaveBeenCalledWith(2);
+    });
+
+    it("calls onQuantityChange with incremented value when plus is clicked", () => {
+      const onQuantityChange = vi.fn();
+      render(
+        <CheckoutCard checkout={mockCheckout} quantity={3} onQuantityChange={onQuantityChange} />
+      );
+
+      screen.getByRole("button", { name: /increase quantity/i }).click();
+
+      expect(onQuantityChange).toHaveBeenCalledWith(4);
+    });
+
+    it("disables decrement button when quantity is 1", () => {
+      render(<CheckoutCard checkout={mockCheckout} quantity={1} />);
+
+      expect(screen.getByRole("button", { name: /decrease quantity/i })).toBeDisabled();
+    });
+
+    it("disables increment button when quantity is 10", () => {
+      render(<CheckoutCard checkout={mockCheckout} quantity={10} />);
+
+      expect(screen.getByRole("button", { name: /increase quantity/i })).toBeDisabled();
+    });
+  });
+
+  describe("processing state", () => {
+    it("shows processing text when isProcessing is true", () => {
+      render(<CheckoutCard checkout={mockCheckout} isProcessing={true} />);
+
+      expect(screen.getByText("Processing...")).toBeInTheDocument();
+    });
+
+    it("disables continue button when processing", () => {
+      render(<CheckoutCard checkout={mockCheckout} isProcessing={true} />);
+
+      expect(screen.getByRole("button", { name: /processing/i })).toBeDisabled();
+    });
+
+    it("disables quantity controls when processing", () => {
+      render(<CheckoutCard checkout={mockCheckout} quantity={5} isProcessing={true} />);
+
+      expect(screen.getByRole("button", { name: /decrease quantity/i })).toBeDisabled();
+      expect(screen.getByRole("button", { name: /increase quantity/i })).toBeDisabled();
+    });
+  });
+
+  describe("with product prop", () => {
+    it("uses product name when provided", () => {
+      render(<CheckoutCard checkout={mockCheckout} product={mockProduct} />);
+
+      expect(screen.getByText("Deluxe Shirt")).toBeInTheDocument();
+    });
+
+    it("uses product variant and size when provided", () => {
+      render(<CheckoutCard checkout={mockCheckout} product={mockProduct} />);
+
+      expect(screen.getByText("Black - Large")).toBeInTheDocument();
+    });
+
+    it("displays total from backend checkout data", () => {
+      
+      
+      
+      const checkoutWithQuantity2 = {
+        ...mockCheckout,
+        subtotal: 5000, 
+        shipping: 500,
+        total: 5500, 
+      };
+      render(<CheckoutCard checkout={checkoutWithQuantity2} product={mockProduct} quantity={2} />);
+
+      expect(screen.getByText("$55.00")).toBeInTheDocument();
+    });
+  });
+
+  describe("shipping selection", () => {
+    it("renders shipping Select component when fulfillment options exist", () => {
+      render(<CheckoutCard checkout={mockCheckout} />);
+
+      
+      expect(screen.getByRole("combobox")).toBeInTheDocument();
+    });
+
+    it("disables shipping Select when processing", () => {
+      render(<CheckoutCard checkout={mockCheckout} isProcessing={true} />);
+
+      
+      const selectTrigger = screen.getByRole("combobox");
+      expect(selectTrigger).toHaveAttribute("aria-disabled", "true");
+    });
+  });
+
+  describe("coupon input", () => {
+    it("renders coupon textbox and apply button", () => {
+      render(<CheckoutCard checkout={mockCheckout} />);
+
+      expect(screen.getByLabelText("Coupon code")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /apply coupon/i })).toBeInTheDocument();
+    });
+
+    it("calls onApplyCoupon with normalized code", () => {
+      const onApplyCoupon = vi.fn();
+      render(<CheckoutCard checkout={mockCheckout} onApplyCoupon={onApplyCoupon} />);
+
+      const input = screen.getByLabelText("Coupon code");
+      fireEvent.change(input, { target: { value: "save10" } });
+      screen.getByRole("button", { name: /apply coupon/i }).click();
+
+      expect(onApplyCoupon).toHaveBeenCalledWith("SAVE10");
+    });
+
+    it("shows one invalid-code message when warning duplicates rejected entry", () => {
+      const checkoutWithDuplicateWarning = {
+        ...mockCheckout,
+        discounts: {
+          codes: ["SAVE1"],
+          applied: [],
+          rejected: [
+            {
+              code: "SAVE1",
+              reason: "discount_code_invalid",
+              message: "Code 'SAVE1' is not recognized.",
+            },
+          ],
+        },
+        messages: [
+          {
+            type: "warning" as const,
+            code: "discount_code_invalid",
+            content: "Code 'SAVE1' is not recognized.",
+          },
+        ],
+      };
+
+      render(<CheckoutCard checkout={checkoutWithDuplicateWarning} />);
+
+      expect(screen.getAllByText("Code 'SAVE1' is not recognized.")).toHaveLength(1);
+    });
+  });
+
+  describe("session status handling", () => {
+    it("shows incomplete status when not ready for payment", () => {
+      render(<CheckoutCard checkout={mockCheckout} isReadyForPayment={false} />);
+
+      expect(screen.getByText("Incomplete")).toBeInTheDocument();
+    });
+
+    it("shows correct button text when not ready for payment", () => {
+      render(<CheckoutCard checkout={mockCheckout} isReadyForPayment={false} />);
+
+      expect(screen.getByText("Complete details to continue")).toBeInTheDocument();
+    });
+
+    it("disables continue button when not ready for payment", () => {
+      render(<CheckoutCard checkout={mockCheckout} isReadyForPayment={false} />);
+
+      const continueButton = screen.getByRole("button", { name: /continue to payment/i });
+      expect(continueButton).toBeDisabled();
+    });
+
+    it("enables continue button when ready for payment", () => {
+      render(<CheckoutCard checkout={mockCheckout} isReadyForPayment={true} />);
+
+      const continueButton = screen.getByRole("button", { name: /continue to payment/i });
+      expect(continueButton).not.toBeDisabled();
+    });
+
+    it("shows processing indicator when isProcessing is true", () => {
+      render(<CheckoutCard checkout={mockCheckout} isProcessing={true} />);
+
+      expect(screen.getByText("Processing")).toBeInTheDocument();
+    });
+
+    it("shows continue button text when ready", () => {
+      render(
+        <CheckoutCard checkout={mockCheckout} isReadyForPayment={true} isProcessing={false} />
+      );
+
+      expect(screen.getByText("Continue")).toBeInTheDocument();
+    });
+  });
+});
