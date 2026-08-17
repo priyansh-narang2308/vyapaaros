@@ -1,0 +1,519 @@
+                                                    
+                                     
+ 
+                                                                 
+                                                                  
+                                         
+ 
+                                            
+ 
+                                                                     
+                                                                   
+                                                                          
+                                                                     
+                                
+
+"""Post-purchase service for generating multilingual shipping updates.
+
+This service integrates with the Post-Purchase Agent (NAT) to generate
+human-like shipping messages based on brand persona and order context.
+
+Architecture:
+- Layer 1: Build message request with brand persona and order context
+- Layer 2: LLM generation (call Post-Purchase Agent REST API)
+- Layer 3: Validate and format response for delivery
+
+This module includes:
+- Enums for shipping status, tone, and language
+- TypedDicts for input/output formats
+- Async client for calling the Post-Purchase Agent REST API
+- Service functions for generating shipping messages
+
+Designed for integration with Feature 11 (Webhook Integration).
+"""
+
+import asyncio
+import json
+import logging
+import time
+from enum import StrEnum
+from typing import TypedDict
+
+import httpx
+
+from src.merchant.config import get_settings
+from src.merchant.services.agent_outcomes import record_agent_outcome
+
+logger = logging.getLogger(__name__)
+
+
+                                                                               
+                                                    
+                                                                               
+
+
+class ShippingStatus(StrEnum):
+    """Shipping status values for post-purchase communications."""
+
+    ORDER_CONFIRMED = "order_confirmed"
+    ORDER_SHIPPED = "order_shipped"
+    OUT_FOR_DELIVERY = "out_for_delivery"
+    DELIVERED = "delivered"
+
+
+                                                                               
+                                         
+                                                                               
+
+
+class MessageTone(StrEnum):
+    """Available tone options for brand persona."""
+
+    FRIENDLY = "friendly"                                             
+    PROFESSIONAL = "professional"                                
+    CASUAL = "casual"                                     
+    URGENT = "urgent"                                           
+
+
+                                                                               
+                                                
+                                                                               
+
+
+class SupportedLanguage(StrEnum):
+    """Supported languages for message generation."""
+
+    ENGLISH = "en"
+    SPANISH = "es"
+    FRENCH = "fr"
+
+
+                                                                               
+                                                                   
+                                                                               
+
+
+class BrandPersona(TypedDict):
+    """Brand persona configuration for message generation."""
+
+    company_name: str                                           
+    tone: str                     
+    preferred_language: str                           
+
+
+class OrderContext(TypedDict):
+    """Order information for message personalization."""
+
+    order_id: str                    
+    customer_name: str                         
+    items: list["OrderItem"]                   
+    tracking_url: str | None                                      
+    estimated_delivery: str | None                                        
+
+
+class OrderItem(TypedDict):
+    """Item info for post-purchase messaging."""
+
+    name: str
+    quantity: int
+
+
+class ShippingMessageRequest(TypedDict):
+    """Input format sent from ACP endpoint to Post-Purchase Agent."""
+
+    brand_persona: BrandPersona
+    order: OrderContext
+    status: str                        
+
+
+class ShippingMessageResponse(TypedDict):
+    """Output format returned by Post-Purchase Agent to ACP endpoint."""
+
+    order_id: str
+    status: str                        
+    language: str                           
+    subject: str                      
+    message: str                     
+
+
+                                                                               
+                                                                        
+                                                                               
+
+
+class PostPurchaseAgentClient:
+    """Async HTTP client for calling the Post-Purchase Agent REST API.
+
+    Designed for fail-open behavior: if the agent is unavailable,
+    returns None and the caller should use fallback templates.
+    """
+
+    def __init__(self, base_url: str, timeout: float = 15.0):
+        """Initialize the post-purchase agent client.
+
+        Args:
+            base_url: Base URL of the Post-Purchase Agent (e.g., http://localhost:8003)
+            timeout: Request timeout in seconds (default: 15.0 for message generation)
+        """
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    async def generate_message(
+        self, request: ShippingMessageRequest
+    ) -> ShippingMessageResponse | None:
+        """Call the Post-Purchase Agent to generate a shipping message.
+
+        Args:
+            request: Shipping message request with brand persona and order context.
+
+        Returns:
+            ShippingMessageResponse if successful, None if agent unavailable.
+            Fails open - logs warnings but does not raise exceptions.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                                                                                   
+                response = await client.post(
+                    f"{self.base_url}/generate",
+                    json={"input_message": json.dumps(request)},
+                    headers={"Content-Type": "application/json"},
+                )
+
+                if response.status_code != 200:
+                    logger.warning(
+                        "Post-purchase agent returned status %d: %s",
+                        response.status_code,
+                        response.text,
+                    )
+                    return None
+
+                                          
+                result = response.json()
+
+                                                                           
+                if "value" in result:
+                    try:
+                        message_data = json.loads(result["value"])
+                        return ShippingMessageResponse(
+                            order_id=message_data.get(
+                                "order_id", request["order"]["order_id"]
+                            ),
+                            status=message_data.get("status", request["status"]),
+                            language=message_data.get(
+                                "language",
+                                request["brand_persona"]["preferred_language"],
+                            ),
+                            subject=message_data.get("subject", ""),
+                            message=message_data.get("message", ""),
+                        )
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            "Failed to parse post-purchase agent response as JSON: %s",
+                            e,
+                        )
+                        return None
+
+                logger.warning(
+                    "Unexpected response format from post-purchase agent: %s", result
+                )
+                return None
+
+        except httpx.TimeoutException:
+            logger.warning(
+                "Post-purchase agent request timed out after %.1f seconds", self.timeout
+            )
+            return None
+        except httpx.ConnectError as e:
+            logger.warning(
+                "Failed to connect to post-purchase agent at %s: %s", self.base_url, e
+            )
+            return None
+        except asyncio.CancelledError:
+            logger.warning("Post-purchase agent request was cancelled")
+            raise
+        except Exception as e:
+            logger.warning("Unexpected error calling post-purchase agent: %s", e)
+            return None
+
+
+                                                                               
+                                                   
+                                                                               
+
+_default_client: PostPurchaseAgentClient | None = None
+
+
+def get_post_purchase_client(
+    base_url: str, timeout: float = 15.0
+) -> PostPurchaseAgentClient:
+    """Get or create the default post-purchase agent client.
+
+    Args:
+        base_url: Base URL of the Post-Purchase Agent.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        PostPurchaseAgentClient instance.
+    """
+    global _default_client
+    if _default_client is None or _default_client.base_url != base_url:
+        _default_client = PostPurchaseAgentClient(base_url, timeout)
+    return _default_client
+
+
+                                                                               
+                                                     
+                                                                               
+
+                                          
+FALLBACK_TEMPLATES: dict[str, dict[str, dict[str, str]]] = {
+    "en": {
+        ShippingStatus.ORDER_CONFIRMED.value: {
+            "subject": "Order Confirmed",
+            "message": "Thank you for your order, {customer_name}! Your {items} order has been confirmed.\n\n- {company_name}",
+        },
+        ShippingStatus.ORDER_SHIPPED.value: {
+            "subject": "Your Order Has Shipped",
+            "message": "Hi {customer_name}, your {items} is on its way!\n\nTrack your package: {tracking_url}\n\n- {company_name}",
+        },
+        ShippingStatus.OUT_FOR_DELIVERY.value: {
+            "subject": "Out for Delivery",
+            "message": "Hi {customer_name}, your {items} will arrive today!\n\nTrack your package: {tracking_url}\n\n- {company_name}",
+        },
+        ShippingStatus.DELIVERED.value: {
+            "subject": "Your Order Has Been Delivered",
+            "message": "Hi {customer_name}, your {items} has been delivered! We hope you enjoy it.\n\n- {company_name}",
+        },
+    },
+    "es": {
+        ShippingStatus.ORDER_CONFIRMED.value: {
+            "subject": "Pedido Confirmado",
+            "message": "¡Gracias por tu pedido, {customer_name}! Tu pedido de {items} ha sido confirmado.\n\n- {company_name}",
+        },
+        ShippingStatus.ORDER_SHIPPED.value: {
+            "subject": "Tu Pedido Ha Sido Enviado",
+            "message": "Hola {customer_name}, tu {items} está en camino.\n\nRastrear paquete: {tracking_url}\n\n- {company_name}",
+        },
+        ShippingStatus.OUT_FOR_DELIVERY.value: {
+            "subject": "En Reparto",
+            "message": "Hola {customer_name}, tu {items} llegará hoy.\n\nRastrear paquete: {tracking_url}\n\n- {company_name}",
+        },
+        ShippingStatus.DELIVERED.value: {
+            "subject": "Tu Pedido Ha Sido Entregado",
+            "message": "Hola {customer_name}, tu {items} ha sido entregado. ¡Esperamos que lo disfrutes!\n\n- {company_name}",
+        },
+    },
+    "fr": {
+        ShippingStatus.ORDER_CONFIRMED.value: {
+            "subject": "Commande Confirmée",
+            "message": "Merci pour votre commande, {customer_name} ! Votre commande de {items} a été confirmée.\n\n- {company_name}",
+        },
+        ShippingStatus.ORDER_SHIPPED.value: {
+            "subject": "Votre Commande a été Expédiée",
+            "message": "Bonjour {customer_name}, votre {items} est en route !\n\nSuivre le colis : {tracking_url}\n\n- {company_name}",
+        },
+        ShippingStatus.OUT_FOR_DELIVERY.value: {
+            "subject": "En Cours de Livraison",
+            "message": "Bonjour {customer_name}, votre {items} arrivera aujourd'hui !\n\nSuivre le colis : {tracking_url}\n\n- {company_name}",
+        },
+        ShippingStatus.DELIVERED.value: {
+            "subject": "Votre Commande a été Livrée",
+            "message": "Bonjour {customer_name}, votre {items} a été livré ! Nous espérons qu'il vous plaira.\n\n- {company_name}",
+        },
+    },
+}
+
+
+def format_order_items(items: list[OrderItem]) -> str:
+    if not items:
+        return ""
+    return ", ".join(f"{item['name']} (x{item['quantity']})" for item in items)
+
+
+def get_fallback_message(
+    request: ShippingMessageRequest,
+) -> ShippingMessageResponse:
+    """Generate a fallback message when agent is unavailable.
+
+    Args:
+        request: The original shipping message request.
+
+    Returns:
+        ShippingMessageResponse with template-based message.
+    """
+    language = request["brand_persona"]["preferred_language"]
+    status = request["status"]
+    order = request["order"]
+    persona = request["brand_persona"]
+
+                                                    
+    lang_templates = FALLBACK_TEMPLATES.get(language, FALLBACK_TEMPLATES["en"])
+    template = lang_templates.get(
+        status, lang_templates[ShippingStatus.ORDER_CONFIRMED.value]
+    )
+
+                                     
+    items_text = format_order_items(order.get("items", []))
+    format_data = {
+        "customer_name": order["customer_name"],
+        "items": items_text or "your order",
+        "tracking_url": order.get("tracking_url") or "",
+        "company_name": persona["company_name"],
+    }
+
+    return ShippingMessageResponse(
+        order_id=order["order_id"],
+        status=status,
+        language=language,
+        subject=template["subject"],
+        message=template["message"].format(**format_data),
+    )
+
+
+                                                                               
+                   
+                                                                               
+
+
+def build_message_request(
+    order_id: str,
+    customer_name: str,
+    items: list[OrderItem],
+    status: ShippingStatus,
+    company_name: str = "Acme T-Shirts",
+    tone: MessageTone = MessageTone.FRIENDLY,
+    language: SupportedLanguage = SupportedLanguage.ENGLISH,
+    tracking_url: str | None = None,
+    estimated_delivery: str | None = None,
+) -> ShippingMessageRequest:
+    """Build a shipping message request.
+
+    Convenience function to construct a properly formatted request.
+
+    Args:
+        order_id: Order identifier.
+        customer_name: Customer's first name.
+        items: Items included in the order.
+        status: Current shipping status.
+        company_name: Retailer's name.
+        tone: Message tone.
+        language: Preferred language.
+        tracking_url: Package tracking URL (optional).
+        estimated_delivery: Estimated delivery date in ISO format (optional).
+
+    Returns:
+        ShippingMessageRequest ready to send to the agent.
+    """
+    return ShippingMessageRequest(
+        brand_persona=BrandPersona(
+            company_name=company_name,
+            tone=tone.value,
+            preferred_language=language.value,
+        ),
+        order=OrderContext(
+            order_id=order_id,
+            customer_name=customer_name,
+            items=items,
+            tracking_url=tracking_url,
+            estimated_delivery=estimated_delivery,
+        ),
+        status=status.value,
+    )
+
+
+async def generate_shipping_message(
+    request: ShippingMessageRequest,
+    client: PostPurchaseAgentClient | None = None,
+) -> ShippingMessageResponse:
+    """Generate a shipping message using the Post-Purchase Agent.
+
+    Handles fail-open behavior: returns fallback template if agent is unavailable.
+
+    Args:
+        request: Shipping message request with brand persona and order context.
+        client: Optional custom client (uses default if not provided).
+
+    Returns:
+        ShippingMessageResponse with generated or fallback message.
+    """
+    started = time.perf_counter()
+    status = "success"
+    error_code: str | None = None
+
+    try:
+        if client is None:
+            settings = get_settings()
+                                                                           
+            agent_url = getattr(settings, "post_purchase_agent_url", None)
+            if agent_url:
+                client = get_post_purchase_client(
+                    agent_url,
+                    getattr(settings, "post_purchase_agent_timeout", 15.0),
+                )
+            else:
+                logger.info(
+                    "Post-purchase agent URL not configured, using fallback template"
+                )
+                status = "fallback_success"
+                error_code = "agent_not_configured"
+                return get_fallback_message(request)
+
+        response = await client.generate_message(request)
+
+        if response is None:
+            logger.info(
+                "Post-purchase agent unavailable for order %s, using fallback template",
+                request["order"]["order_id"],
+            )
+            status = "fallback_success"
+            error_code = "agent_unavailable"
+            return get_fallback_message(request)
+
+        return response
+    except Exception:
+        status = "error_internal"
+        error_code = "internal_exception"
+        raise
+    finally:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        record_agent_outcome(
+            agent_type="post_purchase",
+            channel="acp",
+            status=status,
+            latency_ms=latency_ms,
+            error_code=error_code,
+        )
+
+
+async def generate_shipping_messages_batch(
+    requests: list[ShippingMessageRequest],
+    client: PostPurchaseAgentClient | None = None,
+) -> list[ShippingMessageResponse]:
+    """Generate shipping messages for multiple orders in parallel.
+
+    Designed for batch processing (e.g., webhook delivery).
+
+    Args:
+        requests: List of shipping message requests.
+        client: Optional custom client for testing.
+
+    Returns:
+        List of ShippingMessageResponse in same order as input requests.
+    """
+    tasks = [generate_shipping_message(req, client) for req in requests]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                                                       
+    processed_results: list[ShippingMessageResponse] = []
+    for i, result in enumerate(results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "Exception generating message for order %s: %s",
+                requests[i]["order"]["order_id"],
+                result,
+            )
+            processed_results.append(get_fallback_message(requests[i]))
+        else:
+            processed_results.append(result)
+
+    return processed_results
