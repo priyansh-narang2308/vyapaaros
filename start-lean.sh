@@ -16,7 +16,7 @@ ok()   { printf "${GREEN}[OK]${NC} %s\n" "$1"; }
 info() { printf "${BOLD}[..]${NC} %s\n" "$1"; }
 
 pkill -f uvicorn 2>/dev/null || true
-pkill -f "pnpm dev" 2>/dev/null || true
+pkill -f "pnpm start" 2>/dev/null || true
 pkill -f "next dev" 2>/dev/null || true
 sleep 1
 
@@ -62,7 +62,7 @@ echo "$!:apps-sdk" >> "$PID_FILE"
 ok "Apps SDK MCP (port 2091)"
 
 cd "$UI_DIR"
-pnpm dev > "$LOG_DIR/ui.log" 2>&1 &
+pnpm start > "$LOG_DIR/ui.log" 2>&1 &
 echo "$!:ui" >> "$PID_FILE"
 ok "UI (port 3000)"
 cd "$ROOT_DIR"
