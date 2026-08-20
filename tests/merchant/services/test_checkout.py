@@ -1,0 +1,530 @@
+                                                    
+                                     
+ 
+                                                                 
+                                                                  
+                                         
+ 
+                                            
+ 
+                                                                     
+                                                                   
+                                                                          
+                                                                     
+                                
+
+"""Tests for the checkout service module.
+
+Tests cover:
+- Line item calculation and recalculation
+- Promotion data preservation during updates
+- Optimization: skip promotion agent on session updates
+"""
+
+import pytest
+
+from src.merchant.db.models import Product
+from src.merchant.domain.checkout.calculations import (
+    apply_discount_codes,
+    calculate_line_item,
+    recalculate_line_item_from_existing,
+)
+
+                                                                               
+               
+                                                                               
+
+
+@pytest.fixture
+def sample_product() -> Product:
+    """Create a sample product for testing."""
+    return Product(
+        id="prod_test",
+        sku="TEST-001",
+        name="Test Product",
+        base_price=2500,          
+        stock_count=100,
+        min_margin=0.15,
+        image_url="https://example.com/test.png",
+    )
+
+
+@pytest.fixture
+def existing_line_item_with_discount() -> dict:
+    """Create an existing line item with promotion discount."""
+    return {
+        "id": "li_existing",
+        "item": {"id": "prod_test", "quantity": 2},
+        "base_amount": 5000,            
+        "discount": 500,                                   
+        "subtotal": 4500,
+        "tax": 450,
+        "total": 4950,
+        "promotion": {
+            "action": "DISCOUNT_10_PCT",
+            "reason_codes": ["HIGH_INVENTORY", "ABOVE_MARKET"],
+            "reasoning": "High inventory and above market pricing justifies 10% discount.",
+        },
+    }
+
+
+@pytest.fixture
+def existing_line_item_no_discount() -> dict:
+    """Create an existing line item without promotion."""
+    return {
+        "id": "li_no_promo",
+        "item": {"id": "prod_test", "quantity": 1},
+        "base_amount": 2500,
+        "discount": 0,
+        "subtotal": 2500,
+        "tax": 250,
+        "total": 2750,
+        "promotion": {
+            "action": "NO_PROMO",
+            "reason_codes": [],
+            "reasoning": "No promotion applied.",
+        },
+    }
+
+
+                                                                               
+                           
+                                                                               
+
+
+class TestCalculateLineItem:
+    """Tests for the calculate_line_item function."""
+
+    def test_calculates_base_amount_correctly(self, sample_product: Product) -> None:
+        """Happy path: Base amount is quantity * base_price."""
+        result = calculate_line_item(sample_product, quantity=3)
+
+        assert result["base_amount"] == 7500            
+
+    def test_calculates_discount_correctly(self, sample_product: Product) -> None:
+        """Happy path: Discount is quantity * discount_per_unit."""
+        result = calculate_line_item(sample_product, quantity=2, discount_per_unit=250)
+
+        assert result["discount"] == 500           
+
+    def test_calculates_subtotal_as_base_minus_discount(
+        self, sample_product: Product
+    ) -> None:
+        """Happy path: Subtotal is base_amount - discount."""
+        result = calculate_line_item(sample_product, quantity=2, discount_per_unit=250)
+
+        assert result["subtotal"] == 4500              
+
+    def test_calculates_tax_as_10_percent_of_subtotal(
+        self, sample_product: Product
+    ) -> None:
+        """Happy path: Tax is 10% of subtotal."""
+        result = calculate_line_item(sample_product, quantity=2)
+
+                                                           
+                                 
+        assert result["tax"] == 500
+
+    def test_calculates_total_as_subtotal_plus_tax(
+        self, sample_product: Product
+    ) -> None:
+        """Happy path: Total is subtotal + tax."""
+        result = calculate_line_item(sample_product, quantity=2)
+
+                                                  
+        assert result["total"] == 5500
+
+    def test_generates_line_item_id_when_not_provided(
+        self, sample_product: Product
+    ) -> None:
+        """Happy path: Generates a new line item ID."""
+        result = calculate_line_item(sample_product, quantity=1)
+
+        assert result["id"].startswith("li_")
+
+    def test_preserves_line_item_id_when_provided(
+        self, sample_product: Product
+    ) -> None:
+        """Happy path: Preserves existing line item ID when provided."""
+        result = calculate_line_item(
+            sample_product, quantity=1, line_item_id="li_preserved"
+        )
+
+        assert result["id"] == "li_preserved"
+
+    def test_includes_promotion_metadata_when_provided(
+        self, sample_product: Product
+    ) -> None:
+        """Happy path: Includes promotion metadata in result."""
+        promotion_info = {
+            "action": "DISCOUNT_5_PCT",
+            "reason_codes": ["HIGH_INVENTORY"],
+            "reasoning": "Test reasoning",
+        }
+        result = calculate_line_item(
+            sample_product, quantity=1, promotion_info=promotion_info
+        )
+
+        assert "promotion" in result
+        assert result["promotion"]["action"] == "DISCOUNT_5_PCT"
+        assert result["promotion"]["reason_codes"] == ["HIGH_INVENTORY"]
+        assert result["promotion"]["reasoning"] == "Test reasoning"
+
+    def test_no_promotion_when_none_provided(self, sample_product: Product) -> None:
+        """Edge case: No promotion key when promotion_info is None."""
+        result = calculate_line_item(sample_product, quantity=1)
+
+        assert "promotion" not in result
+
+    def test_zero_quantity_results_in_zero_amounts(
+        self, sample_product: Product
+    ) -> None:
+        """Edge case: Zero quantity results in zero amounts."""
+        result = calculate_line_item(sample_product, quantity=0)
+
+        assert result["base_amount"] == 0
+        assert result["discount"] == 0
+        assert result["subtotal"] == 0
+        assert result["tax"] == 0
+        assert result["total"] == 0
+
+
+                                                                               
+                                           
+                                                                               
+
+
+class TestRecalculateLineItemFromExisting:
+    """Tests for the recalculate_line_item_from_existing function.
+
+    This is the key optimization: reuse existing promotion data
+    instead of re-calling the promotion agent.
+    """
+
+    def test_preserves_per_unit_discount_when_quantity_changes(
+        self, sample_product: Product, existing_line_item_with_discount: dict
+    ) -> None:
+        """Happy path: Per-unit discount is preserved when quantity changes."""
+                                                                      
+                                                        
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=4,
+            existing_line_item=existing_line_item_with_discount,
+        )
+
+                                                   
+                                               
+        assert result["discount"] == 1000
+
+    def test_recalculates_base_amount_for_new_quantity(
+        self, sample_product: Product, existing_line_item_with_discount: dict
+    ) -> None:
+        """Happy path: Base amount is recalculated for new quantity."""
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=5,
+            existing_line_item=existing_line_item_with_discount,
+        )
+
+                          
+        assert result["base_amount"] == 12500
+
+    def test_recalculates_subtotal_tax_total(
+        self, sample_product: Product, existing_line_item_with_discount: dict
+    ) -> None:
+        """Happy path: Subtotal, tax, and total are recalculated correctly."""
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=4,
+            existing_line_item=existing_line_item_with_discount,
+        )
+
+                                        
+                                   
+                                        
+                                 
+                                   
+        assert result["base_amount"] == 10000
+        assert result["discount"] == 1000
+        assert result["subtotal"] == 9000
+        assert result["tax"] == 900
+        assert result["total"] == 9900
+
+    def test_preserves_line_item_id(
+        self, sample_product: Product, existing_line_item_with_discount: dict
+    ) -> None:
+        """Happy path: Line item ID is preserved from existing item."""
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=3,
+            existing_line_item=existing_line_item_with_discount,
+        )
+
+        assert result["id"] == "li_existing"
+
+    def test_preserves_promotion_metadata(
+        self, sample_product: Product, existing_line_item_with_discount: dict
+    ) -> None:
+        """Happy path: Promotion metadata is preserved from existing item."""
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=3,
+            existing_line_item=existing_line_item_with_discount,
+        )
+
+        assert "promotion" in result
+        assert result["promotion"]["action"] == "DISCOUNT_10_PCT"
+        assert result["promotion"]["reason_codes"] == ["HIGH_INVENTORY", "ABOVE_MARKET"]
+        assert "10% discount" in result["promotion"]["reasoning"]
+
+    def test_handles_no_discount_gracefully(
+        self, sample_product: Product, existing_line_item_no_discount: dict
+    ) -> None:
+        """Edge case: Handles items with no discount correctly."""
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=3,
+            existing_line_item=existing_line_item_no_discount,
+        )
+
+                                                         
+        assert result["discount"] == 0
+        assert result["promotion"]["action"] == "NO_PROMO"
+
+    def test_handles_zero_existing_quantity(self, sample_product: Product) -> None:
+        """Edge case: Handles zero existing quantity without division error."""
+        existing_item = {
+            "id": "li_zero",
+            "item": {"id": "prod_test", "quantity": 0},
+            "base_amount": 0,
+            "discount": 0,
+            "subtotal": 0,
+            "tax": 0,
+            "total": 0,
+        }
+
+        result = recalculate_line_item_from_existing(
+            sample_product, quantity=2, existing_line_item=existing_item
+        )
+
+                                                      
+        assert result["discount"] == 0
+        assert result["base_amount"] == 5000            
+
+    def test_handles_missing_promotion_key(self, sample_product: Product) -> None:
+        """Edge case: Handles existing item without promotion key."""
+        existing_item = {
+            "id": "li_no_promo_key",
+            "item": {"id": "prod_test", "quantity": 1},
+            "base_amount": 2500,
+            "discount": 0,
+            "subtotal": 2500,
+            "tax": 250,
+            "total": 2750,
+                                
+        }
+
+        result = recalculate_line_item_from_existing(
+            sample_product, quantity=2, existing_line_item=existing_item
+        )
+
+                                   
+        assert result["base_amount"] == 5000
+        assert "promotion" not in result
+
+    def test_handles_missing_discount_key(self, sample_product: Product) -> None:
+        """Edge case: Handles existing item without discount key."""
+        existing_item = {
+            "id": "li_no_discount_key",
+            "item": {"id": "prod_test", "quantity": 1},
+            "base_amount": 2500,
+                               
+            "subtotal": 2500,
+            "tax": 250,
+            "total": 2750,
+        }
+
+        result = recalculate_line_item_from_existing(
+            sample_product, quantity=2, existing_line_item=existing_item
+        )
+
+                                      
+        assert result["discount"] == 0
+
+    def test_quantity_one_preserves_exact_discount(
+        self, sample_product: Product, existing_line_item_with_discount: dict
+    ) -> None:
+        """Edge case: Single quantity preserves per-unit discount exactly."""
+        result = recalculate_line_item_from_existing(
+            sample_product,
+            quantity=1,
+            existing_line_item=existing_line_item_with_discount,
+        )
+
+                                                           
+                                              
+        assert result["discount"] == 250
+
+
+                                                                               
+                                                                 
+                                                                               
+
+
+class TestUpdateSessionSkipsPromotionAgent:
+    """Integration tests verifying the optimization:
+    session updates do not call the promotion agent for existing products.
+
+    Note: These tests verify the logic at a lower level since full service
+    integration tests require complex database mocking. The API-level tests
+    in test_checkout.py provide end-to-end coverage.
+    """
+
+    def test_recalculate_preserves_discount_per_unit(
+        self, sample_product: Product
+    ) -> None:
+        """Verify the core optimization: existing discount is preserved."""
+                                                                                  
+        existing_item = {
+            "id": "li_existing",
+            "item": {"id": "prod_test", "quantity": 2},
+            "base_amount": 5000,
+            "discount": 500,           
+            "subtotal": 4500,
+            "tax": 450,
+            "total": 4950,
+            "promotion": {
+                "action": "DISCOUNT_10_PCT",
+                "reason_codes": ["HIGH_INVENTORY"],
+                "reasoning": "Original promotion from agent",
+            },
+        }
+
+                                                                            
+        result = recalculate_line_item_from_existing(
+            sample_product, quantity=5, existing_line_item=existing_item
+        )
+
+                                                            
+        assert result["discount"] == 1250
+                                      
+        assert result["promotion"]["action"] == "DISCOUNT_10_PCT"
+        assert result["promotion"]["reason_codes"] == ["HIGH_INVENTORY"]
+
+    def test_recalculate_scales_linearly_with_quantity(
+        self, sample_product: Product
+    ) -> None:
+        """Verify discounts scale linearly: double qty = double discount."""
+        existing_item = {
+            "id": "li_test",
+            "item": {"id": "prod_test", "quantity": 1},
+            "base_amount": 2500,
+            "discount": 125,               
+            "subtotal": 2375,
+            "tax": 237,
+            "total": 2612,
+            "promotion": {
+                "action": "DISCOUNT_5_PCT",
+                "reason_codes": [],
+                "reasoning": "Test",
+            },
+        }
+
+        result_qty_2 = recalculate_line_item_from_existing(
+            sample_product, quantity=2, existing_line_item=existing_item
+        )
+        result_qty_10 = recalculate_line_item_from_existing(
+            sample_product, quantity=10, existing_line_item=existing_item
+        )
+
+                                  
+        assert result_qty_2["discount"] == 250           
+        assert result_qty_10["discount"] == 1250            
+
+    def test_new_product_detection_logic(self) -> None:
+        """Verify the logic for detecting new vs existing products."""
+                                             
+        existing_line_items = [
+            {"item": {"id": "prod_existing"}, "discount": 100},
+        ]
+        existing_by_product_id = {li["item"]["id"]: li for li in existing_line_items}
+
+                                         
+        assert "prod_new" not in existing_by_product_id
+
+                                          
+        assert "prod_existing" in existing_by_product_id
+        assert existing_by_product_id["prod_existing"]["discount"] == 100
+
+
+class TestCouponStacking:
+    """Tests for coupon stacking and margin protection logic."""
+
+    def test_save10_stacks_on_existing_promotion(self, sample_product: Product) -> None:
+        """SAVE10 applies on top of promotion discount when margin allows."""
+        line_items = [
+            {
+                "id": "li_1",
+                "item": {"id": sample_product.id, "quantity": 1},
+                "base_amount": 2500,
+                "promotion_discount": 250,
+                "coupon_discount": 0,
+                "discount": 250,
+                "subtotal": 2250,
+                "tax": 225,
+                "total": 2475,
+                "promotion": {"action": "DISCOUNT_10_PCT"},
+            }
+        ]
+
+        updated_items, discounts, warnings = apply_discount_codes(
+            line_items=line_items,
+            products_by_id={sample_product.id: sample_product},
+            submitted_codes=["SAVE10"],
+        )
+
+        assert warnings == []
+        assert discounts["codes"] == ["SAVE10"]
+        assert any(
+            applied.get("code") == "SAVE10" for applied in discounts.get("applied", [])
+        )
+        assert updated_items[0]["discount"] > 250
+
+    def test_margin_guard_clamps_coupon_discount(self, sample_product: Product) -> None:
+        """Coupon is clamped when stacked discount would break margin."""
+        constrained_product = Product(
+            id=sample_product.id,
+            sku=sample_product.sku,
+            name=sample_product.name,
+            base_price=sample_product.base_price,
+            stock_count=sample_product.stock_count,
+            min_margin=0.96,
+            image_url=sample_product.image_url,
+        )
+        line_items = [
+            {
+                "id": "li_2",
+                "item": {"id": constrained_product.id, "quantity": 1},
+                "base_amount": 2500,
+                "promotion_discount": 100,
+                "coupon_discount": 0,
+                "discount": 100,
+                "subtotal": 2400,
+                "tax": 240,
+                "total": 2640,
+                "promotion": {"action": "DISCOUNT_5_PCT"},
+            }
+        ]
+
+        updated_items, discounts, warnings = apply_discount_codes(
+            line_items=line_items,
+            products_by_id={constrained_product.id: constrained_product},
+            submitted_codes=["SAVE10"],
+        )
+
+        assert discounts["codes"] == ["SAVE10"]
+        assert len(discounts["applied"]) == 1                                    
+        assert len(discounts["rejected"]) == 1
+        assert warnings[0]["type"] == "warning"
+        assert updated_items[0]["discount"] == 100
