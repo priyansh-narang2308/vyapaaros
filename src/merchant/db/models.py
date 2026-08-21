@@ -1,18 +1,3 @@
-                                                    
-                                     
- 
-                                                                 
-                                                                  
-                                         
- 
-                                            
- 
-                                                                     
-                                                                   
-                                                                          
-                                                                     
-                                
-
 """SQLModel database models for the Agentic Commerce middleware."""
 
 from datetime import UTC, datetime
@@ -28,9 +13,16 @@ def _utc_now() -> datetime:
 
 
 class CheckoutStatus(StrEnum):
-    """Checkout session status as per ACP specification."""
+    """Authoritative checkout/payment state.
+
+    Legal transitions between these values are defined exclusively by
+    ``src.merchant.domain.payments.state_machine.ALLOWED_TRANSITIONS``. Do not
+    assign this field directly; route through ``assert_transition`` so that
+    illegal moves (e.g. ``completed -> payment_pending``) are rejected.
+    """
 
     NOT_READY_FOR_PAYMENT = "not_ready_for_payment"
+    AWAITING_APPROVAL = "awaiting_approval"
     READY_FOR_PAYMENT = "ready_for_payment"
     PAYMENT_PENDING = "payment_pending"
     FAILED = "failed"
@@ -38,6 +30,34 @@ class CheckoutStatus(StrEnum):
     CAPTURED = "captured"
     COMPLETED = "completed"
     CANCELED = "canceled"
+
+
+class PaymentAttemptState(StrEnum):
+    """Lifecycle of a single attempt to collect money for a session."""
+
+    CREATED = "created"
+    PENDING = "pending"
+    CAPTURED = "captured"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+class ApprovalState(StrEnum):
+    """Lifecycle of a human approval request raised by the policy engine."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+
+
+class WebhookProcessingState(StrEnum):
+    """Processing lifecycle for a durably recorded inbound webhook."""
+
+    RECEIVED = "received"
+    PROCESSED = "processed"
+    FAILED = "failed"
+    IGNORED = "ignored"
 
 
 class AgentInvocationStatus(StrEnum):
@@ -258,3 +278,145 @@ class RecommendationAttributionEvent(SQLModel, table=True):
     quantity: int = Field(default=1)
     revenue_cents: int = Field(default=0)
     source: str = Field(default="apps_sdk", index=True)
+
+
+class PaymentAttempt(SQLModel, table=True):
+    """One attempt to collect money for a checkout session.
+
+    A session may have several attempts (initial failure plus retries). Exactly
+    one Razorpay order is created per attempt; the attempt is the anti-duplicate
+    boundary. ``provider_order_id`` is the *only* authoritative order id -- the
+    value returned by a browser callback is untrusted input and must be compared
+    against this column, never substituted for it.
+    """
+
+    __tablename__: ClassVar[str] = "payment_attempt"  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    id: str = Field(primary_key=True)
+    session_id: str = Field(foreign_key="checkout_session.id", index=True)
+    attempt_number: int = Field(default=1)
+
+    provider: str = Field(default="razorpay", index=True)
+    provider_order_id: str | None = Field(default=None, index=True)
+    provider_payment_id: str | None = Field(default=None, index=True)
+
+    #: Authoritative amount, recomputed server-side at order-creation time.
+    amount_paise: int = Field(default=0)
+    currency: str = Field(default="INR")
+
+    state: PaymentAttemptState = Field(default=PaymentAttemptState.CREATED, index=True)
+
+    signature_verified: bool = Field(default=False)
+    failure_reason: str | None = Field(default=None)
+    failure_code: str | None = Field(default=None)
+
+    #: Serialised PolicyDecision that authorised this attempt.
+    policy_decision_json: str | None = Field(default=None)
+
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
+    updated_at: datetime = Field(default_factory=_utc_now)
+
+
+class ApprovalRequest(SQLModel, table=True):
+    """A human approval gate raised by the deterministic policy engine.
+
+    The approval decision lives server-side. A client cannot self-approve by
+    sending ``approved=true``; it must reference an ``ApprovalRequest`` row that
+    the backend created, and the backend flips the state.
+    """
+
+    __tablename__: ClassVar[str] = "approval_request"  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    id: str = Field(primary_key=True)
+    session_id: str = Field(foreign_key="checkout_session.id", index=True)
+
+    state: ApprovalState = Field(default=ApprovalState.PENDING, index=True)
+    reason_code: str = Field(default="")
+    reason: str = Field(default="")
+
+    #: Amount the approval was granted *for*. If the cart later changes, the
+    #: approval no longer matches and must be re-raised.
+    amount_paise: int = Field(default=0)
+    limit_paise: int = Field(default=0)
+
+    approved_by: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=_utc_now, index=True)
+    resolved_at: datetime | None = Field(default=None)
+
+
+class WebhookEvent(SQLModel, table=True):
+    """Durable record of an inbound provider webhook.
+
+    Persisted *before* business logic runs so that duplicate deliveries are
+    rejected across process restarts and multiple workers. The previous
+    implementation used a module-level ``set()``, which lost all history on
+    restart and did not work behind more than one worker.
+    """
+
+    __tablename__: ClassVar[str] = "webhook_event"  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    #: Provider event id (Razorpay ``X-Razorpay-Event-Id``). Primary key, so the
+    #: uniqueness constraint is enforced by the database, not by application code.
+    id: str = Field(primary_key=True)
+
+    provider: str = Field(default="razorpay", index=True)
+    event_type: str = Field(default="", index=True)
+    payload_hash: str = Field(default="")
+
+    processing_state: WebhookProcessingState = Field(
+        default=WebhookProcessingState.RECEIVED, index=True
+    )
+    processing_error: str | None = Field(default=None)
+
+    session_id: str | None = Field(default=None, index=True)
+    provider_order_id: str | None = Field(default=None, index=True)
+
+    #: Provider-reported creation time, used for replay-window checks.
+    provider_created_at: int | None = Field(default=None)
+    received_at: datetime = Field(default_factory=_utc_now, index=True)
+    processed_at: datetime | None = Field(default=None)
+
+    #: Raw body, retained so processing can be replayed after a code fix without
+    #: asking the provider to redeliver.
+    raw_payload: str = Field(default="")
+
+
+class AuditEvent(SQLModel, table=True):
+    """Append-only, hash-chained audit record for money-affecting actions.
+
+    Each row stores the hash of the previous row for its session, so tampering
+    with or deleting an intermediate event is detectable. This is the artifact a
+    judge reads to understand a transaction without reading application logs.
+    """
+
+    __tablename__: ClassVar[str] = "audit_event"  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    id: int | None = Field(default=None, primary_key=True)
+    sequence: int = Field(default=0, index=True)
+
+    session_id: str | None = Field(default=None, index=True)
+    timestamp: datetime = Field(default_factory=_utc_now, index=True)
+
+    #: Who caused this. One of: ``user``, ``agent:<name>``, ``system``,
+    #: ``provider:razorpay``. Never blank -- accountability is mandatory.
+    actor: str = Field(default="system", index=True)
+    action: str = Field(default="", index=True)
+
+    #: Stable machine-readable code. Human prose belongs in ``reason``.
+    reason_code: str = Field(default="")
+    reason: str = Field(default="")
+
+    #: ALLOW / DENY / REQUIRE_APPROVAL / NOT_APPLICABLE
+    policy_decision: str = Field(default="not_applicable", index=True)
+    outcome: str = Field(default="", index=True)
+
+    amount_paise: int | None = Field(default=None)
+    provider_order_id: str | None = Field(default=None, index=True)
+    provider_payment_id: str | None = Field(default=None, index=True)
+    payment_attempt_id: str | None = Field(default=None, index=True)
+
+    #: Structured, non-chain-of-thought detail (reason codes, limits, signals).
+    detail_json: str = Field(default="{}")
+
+    prev_hash: str = Field(default="")
+    entry_hash: str = Field(default="", index=True)
