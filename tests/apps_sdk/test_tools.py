@@ -25,6 +25,7 @@ Tests cover:
   - checkout: Processing checkout
 """
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -36,7 +37,7 @@ from src.apps_sdk.tools.cart import (
     remove_from_cart,
     update_cart_quantity,
 )
-from src.apps_sdk.tools.checkout import checkout
+from src.apps_sdk.tools.checkout import checkout, process_acp_checkout
 from src.apps_sdk.tools.recommendations import search_products
 
                                                                                
@@ -458,7 +459,60 @@ class TestCheckout:
         result = await checkout(cart_id=cart_id)
 
         assert result["success"] is True
-        assert result["itemCount"] == 4             
+        assert result["itemCount"] == 4
+
+    @pytest.mark.asyncio
+    async def test_checkout_no_fulfillment_options_degrades_gracefully(self) -> None:
+        """A created session with no fulfillment options must not crash.
+
+        Regression: process_acp_checkout read ``update_response.json()``
+        unconditionally, but ``update_response`` is only assigned when a
+        fulfillment option exists (an update POST is made). An empty
+        ``fulfillment_options`` list left the name unbound, so the read raised
+        ``UnboundLocalError`` — surfaced to the caller as a generic
+        ``status: "failed"`` whose error mentioned ``update_response``. The fix
+        reuses the already-fetched ``session_data``, so the tool degrades to a
+        graceful "not ready" result instead.
+        """
+        add_result = await add_to_cart(product_id="prod_1")
+        cart_id = add_result["cartId"]
+
+        create_payload = {
+            "id": "checkout_no_fulfillment",
+            "status": "not_ready_for_payment",
+            "fulfillment_options": [],
+        }
+
+        class _Resp:
+            status_code = 201
+            text = json.dumps(create_payload)
+
+            @staticmethod
+            def json() -> dict:
+                return create_payload
+
+        class _Client:
+            async def __aenter__(self) -> "_Client":
+                return self
+
+            async def __aexit__(self, *exc: object) -> bool:
+                return False
+
+            async def post(self, *args: object, **kwargs: object) -> _Resp:
+                return _Resp()
+
+        # Merchant API "succeeds" (201) but offers no fulfillment options, so the
+        # update POST is skipped and update_response is never assigned.
+        with patch(
+            "src.apps_sdk.tools.checkout.httpx.AsyncClient",
+            return_value=_Client(),
+        ):
+            result = await process_acp_checkout(cart_id)
+
+        assert result["success"] is False
+        assert result["status"] == "not_ready_for_payment"
+        # The old crash surfaced the unbound-name error to the caller.
+        assert "update_response" not in str(result.get("error", ""))
 
 
                                                                                

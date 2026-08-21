@@ -42,6 +42,7 @@ class PaymentProviderEnum(StrEnum):
 
     STRIPE = "stripe"
     ADYEN = "adyen"
+    RAZORPAY = "razorpay"
 
 
 class PaymentMethodEnum(StrEnum):

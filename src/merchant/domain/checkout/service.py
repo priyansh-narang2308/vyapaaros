@@ -17,6 +17,7 @@
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -56,12 +57,14 @@ from src.merchant.domain.payments.attempts import (
     create_payment_attempt,
     ensure_order_for_attempt,
     find_granted_approval,
+    get_attempt_by_order_id,
     get_open_attempt,
     mark_attempt_captured,
     mark_attempt_failed,
     open_approval_request,
 )
 from src.merchant.domain.payments.audit import (
+    ACTOR_PROVIDER_RAZORPAY,
     ACTOR_SYSTEM,
     ACTOR_USER,
     AuditAction,
@@ -822,15 +825,272 @@ async def update_checkout_session_from_data(
     return await update_checkout_session(db, session_id, request)
 
 
+#: States from which a checkout may still be completed. Terminal states
+#: (COMPLETED, CANCELED) and pre-payment states (NOT_READY, AWAITING_APPROVAL)
+#: are excluded so completion cannot skip the gate or double-fire.
+_COMPLETABLE_STATES: frozenset[CheckoutStatus] = frozenset(
+    {
+        CheckoutStatus.READY_FOR_PAYMENT,
+        CheckoutStatus.PAYMENT_PENDING,
+        CheckoutStatus.CAPTURED,
+    }
+)
+
+
+def _finalize_completed(
+    db: Session,
+    session: CheckoutSession,
+    *,
+    actor: str,
+    reason: str,
+) -> CheckoutSessionResponse:
+    """Move a captured session to COMPLETED and record the terminal audit row."""
+    _transition(session, CheckoutStatus.COMPLETED, reason=reason, action="complete")
+
+    order_data = json.loads(session.order_json) if session.order_json else {}
+    order_id = order_data.get("id", "Unknown")
+
+    session.messages_json = json.dumps(
+        [
+            {
+                "type": "info",
+                "param": "$",
+                "content_type": "plain",
+                "content": f"Order {order_id} confirmed! Thank you for your purchase.",
+            }
+        ]
+    )
+    session.updated_at = datetime.now(UTC)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    record_audit_event(
+        db,
+        action=AuditAction.ORDER_COMPLETED,
+        actor=actor,
+        session_id=session.id,
+        reason=reason,
+        outcome=AuditOutcome.SUCCESS,
+        amount_paise=order_data.get("amount"),
+        provider_order_id=order_data.get("id"),
+        provider_payment_id=order_data.get("payment_id"),
+    )
+    logger.info("Order %s completed | session=%s", order_id, session.id)
+    return session_to_response(session)
+
+
+def _reject_payment(
+    db: Session,
+    session: CheckoutSession,
+    attempt: Any | None,
+    *,
+    reason: str,
+    action: AuditAction = AuditAction.PAYMENT_SIGNATURE_REJECTED,
+) -> None:
+    """Record a rejected payment. The session is left payable so a genuine
+    submission can still succeed; only the forged/mismatched attempt is refused.
+    """
+    logger.error("Payment rejected for session %s: %s", session.id, reason)
+    record_audit_event(
+        db,
+        action=action,
+        actor=ACTOR_USER,
+        session_id=session.id,
+        reason=reason,
+        outcome=AuditOutcome.BLOCKED,
+        payment_attempt_id=getattr(attempt, "id", None),
+        provider_order_id=getattr(attempt, "provider_order_id", None),
+    )
+
+
+def _capture_razorpay_payment(
+    db: Session,
+    session: CheckoutSession,
+    attempt: Any | None,
+    token: str,
+) -> None:
+    """Verify a Razorpay Standard Checkout callback and capture the attempt.
+
+    The authoritative order id is the one on our own :class:`PaymentAttempt`, not
+    the value in the client token. The token's order id must equal it, and the
+    HMAC signature must verify, before any state moves. A malformed token is a
+    hard failure -- it is never silently ignored.
+    """
+    try:
+        token_data = json.loads(token)
+    except json.JSONDecodeError as exc:
+        _reject_payment(db, session, attempt, reason="Payment token is not valid JSON.")
+        raise PaymentVerificationError("Payment token is not valid JSON.") from exc
+
+    if not isinstance(token_data, dict):
+        _reject_payment(db, session, attempt, reason="Payment token is not an object.")
+        raise PaymentVerificationError("Payment token is not an object.")
+
+    rzp_order_id = str(token_data.get("razorpay_order_id") or "")
+    rzp_payment_id = str(token_data.get("razorpay_payment_id") or "")
+    rzp_signature = token_data.get("razorpay_signature")
+
+    if attempt is None or not attempt.provider_order_id:
+        _reject_payment(
+            db, session, attempt, reason="No open payment attempt for this session."
+        )
+        raise PaymentVerificationError("No open payment attempt for this session.")
+
+    # The order id is ours, never the client's. Compare, do not substitute.
+    if rzp_order_id != attempt.provider_order_id:
+        _reject_payment(
+            db,
+            session,
+            attempt,
+            reason=(
+                f"Order id mismatch: token {rzp_order_id!r} != "
+                f"attempt {attempt.provider_order_id!r}."
+            ),
+        )
+        raise PaymentVerificationError("Payment order id does not match this checkout.")
+
+    provider = get_payment_provider()
+    if not provider.verify_payment_signature(
+        order_id=rzp_order_id, payment_id=rzp_payment_id, signature=rzp_signature
+    ):
+        _reject_payment(db, session, attempt, reason="Payment signature verification failed.")
+        raise PaymentVerificationError("Payment signature verification failed.")
+
+    # Verified. The amount is anchored to the signed order (which we created with
+    # our server-side amount), so there is no client amount to re-check here.
+    _transition(
+        session, CheckoutStatus.PAYMENT_PENDING, reason="payment submitted", action="complete"
+    )
+    record_audit_event(
+        db,
+        action=AuditAction.PAYMENT_SIGNATURE_VERIFIED,
+        actor=ACTOR_PROVIDER_RAZORPAY,
+        session_id=session.id,
+        reason="Razorpay payment signature verified.",
+        outcome=AuditOutcome.SUCCESS,
+        amount_paise=attempt.amount_paise,
+        provider_order_id=rzp_order_id,
+        provider_payment_id=rzp_payment_id,
+        payment_attempt_id=attempt.id,
+    )
+
+    mark_attempt_captured(db, attempt=attempt, provider_payment_id=rzp_payment_id)
+    _transition(
+        session, CheckoutStatus.CAPTURED, reason="signature verified", action="complete"
+    )
+
+    order_data = json.loads(session.order_json) if session.order_json else {}
+    order_data["payment_id"] = rzp_payment_id
+    order_data["permalink_url"] = f"{DEFAULT_SHOP_URL}/orders/{rzp_order_id}"
+    order_data.setdefault("checkout_session_id", session.id)
+    session.order_json = json.dumps(order_data)
+
+    record_audit_event(
+        db,
+        action=AuditAction.PAYMENT_CAPTURED,
+        actor=ACTOR_PROVIDER_RAZORPAY,
+        session_id=session.id,
+        reason="Payment captured after signature verification.",
+        outcome=AuditOutcome.SUCCESS,
+        amount_paise=attempt.amount_paise,
+        provider_order_id=rzp_order_id,
+        provider_payment_id=rzp_payment_id,
+        payment_attempt_id=attempt.id,
+    )
+
+
+def _capture_delegated_payment(
+    db: Session,
+    session: CheckoutSession,
+    attempt: Any | None,
+    payment_data: PaymentDataInput,
+) -> None:
+    """Handle the legacy ACP delegated-token rail (Stripe/Adyen-style tokens).
+
+    A delegated token is charged by the PSP off-platform, so we cannot verify it
+    cryptographically here. It is therefore accepted **only** in sandbox/test
+    mode; in live mode it is refused so real money never moves on an unverifiable
+    token. Callers must use the Razorpay rail in production.
+    """
+    token = (payment_data.token or "").strip()
+    if not token:
+        _reject_payment(db, session, attempt, reason="Missing payment token.")
+        raise PaymentVerificationError("A payment token is required.")
+
+    if not is_sandbox_active():
+        _reject_payment(
+            db,
+            session,
+            attempt,
+            reason="Delegated payment token refused outside sandbox mode.",
+        )
+        raise PaymentVerificationError(
+            "Delegated payment tokens are only accepted in sandbox/test mode. "
+            "Use the Razorpay payment rail in production.",
+            code="delegated_not_allowed",
+        )
+
+    provider = get_payment_provider()
+    provider_order_id = getattr(attempt, "provider_order_id", None) or f"order_{session.id}"
+    payment_id_for = getattr(provider, "payment_id_for", None)
+    payment_id = (
+        payment_id_for(provider_order_id)
+        if callable(payment_id_for)
+        else f"pay_sandbox_{session.id}"
+    )
+
+    _transition(
+        session,
+        CheckoutStatus.PAYMENT_PENDING,
+        reason="delegated payment submitted (sandbox)",
+        action="complete",
+    )
+    if attempt is not None:
+        mark_attempt_captured(db, attempt=attempt, provider_payment_id=payment_id)
+    _transition(
+        session,
+        CheckoutStatus.CAPTURED,
+        reason="delegated payment simulated (sandbox)",
+        action="complete",
+    )
+
+    order_data = json.loads(session.order_json) if session.order_json else {}
+    if not order_data:
+        order_data = {"provider": provider.name, "id": provider_order_id}
+    order_data["payment_id"] = payment_id
+    order_data["permalink_url"] = f"{DEFAULT_SHOP_URL}/orders/{order_data.get('id')}"
+    order_data.setdefault("checkout_session_id", session.id)
+    session.order_json = json.dumps(order_data)
+
+    record_audit_event(
+        db,
+        action=AuditAction.PAYMENT_CAPTURED,
+        actor=ACTOR_SYSTEM,
+        session_id=session.id,
+        reason="Delegated payment simulated and captured in sandbox/test mode.",
+        outcome=AuditOutcome.SUCCESS,
+        amount_paise=getattr(attempt, "amount_paise", None),
+        provider_order_id=order_data.get("id"),
+        provider_payment_id=payment_id,
+        payment_attempt_id=getattr(attempt, "id", None),
+        detail={"test_mode": True, "rail": "delegated"},
+    )
+
+
 def complete_checkout_session(
     db: Session,
     session_id: str,
     payment_data: PaymentDataInput,
     buyer: BuyerInput | None = None,
 ) -> CheckoutSessionResponse:
-    """Complete a checkout session with payment.
+    """Complete a checkout session with a verified payment.
 
-    Validates Razorpay payment signature before completing the checkout.
+    Dispatches on the payment token: a Razorpay callback token is verified with a
+    real HMAC signature check against the order id we created, while a legacy
+    delegated token is accepted only in sandbox/test mode. Every status change is
+    routed through the payment state machine, and each step is audited. The money
+    path the model can trigger ends here at the backend, never in the model.
     """
     logger.info(f"Completing checkout session {session_id}")
 
@@ -842,97 +1102,68 @@ def complete_checkout_session(
         logger.warning(f"Session not found for completion: {session_id}")
         raise SessionNotFoundError(session_id)
 
-    # Allow completion if already CAPTURED via webhook
+    # Update buyer if provided (allowed regardless of the rail taken below).
+    if buyer is not None:
+        session.buyer_json = json.dumps(buyer_input_to_dict(buyer))
+
+    # Idempotent finish: already captured out-of-band (e.g. by a webhook).
     if session.status == CheckoutStatus.CAPTURED:
-        logger.info(f"Session {session_id} was already captured via webhook.")
-        session.status = CheckoutStatus.COMPLETED
-        # Update message
-        complete_messages: list[dict[str, Any]] = [
-            {
-                "type": "info",
-                "param": "$",
-                "content_type": "plain",
-                "content": "Order confirmed! Thank you for your purchase.",
-            }
-        ]
-        session.messages_json = json.dumps(complete_messages)
+        logger.info(f"Session {session_id} was already captured; finalizing.")
+        return _finalize_completed(
+            db,
+            session,
+            actor=ACTOR_SYSTEM,
+            reason="Order confirmed after out-of-band capture.",
+        )
+
+    # A caller may complete a session that was never explicitly moved to READY.
+    # The UCP flow in particular completes right after create with no update
+    # step. If the session now satisfies every required field, run the same
+    # server-side gate the update path uses -- pricing the amount from stored
+    # totals, applying the deterministic policy, and opening exactly one payment
+    # attempt + provider order -- before any payment is accepted. Sessions that
+    # remain incomplete, that policy denies, or that policy routes to
+    # AWAITING_APPROVAL do not become payable here and still fall through to the
+    # 405 below. This runs entirely in the backend domain; the LLM cannot reach
+    # it, and the amount/policy/order are always ours, never the client's.
+    if (
+        session.status
+        in (
+            CheckoutStatus.NOT_READY_FOR_PAYMENT,
+            CheckoutStatus.AWAITING_APPROVAL,
+        )
+        and check_ready_for_payment(session)
+    ):
+        _prepare_session_for_payment(db, session)
         session.updated_at = datetime.now(UTC)
         db.add(session)
         db.commit()
         db.refresh(session)
-        return session_to_response(session)
 
-    # Check if session can be completed
-    if session.status in (CheckoutStatus.COMPLETED, CheckoutStatus.CANCELED, CheckoutStatus.NOT_READY_FOR_PAYMENT):
-        logger.warning(f"Session {session_id} cannot be completed from status {session.status}")
+    # Only genuinely payable sessions may be completed.
+    if session.status not in _COMPLETABLE_STATES:
+        logger.warning(
+            f"Session {session_id} cannot be completed from status {session.status.value}"
+        )
         raise InvalidStateTransitionError(session.status.value, "complete")
 
-    # Update buyer if provided
-    if buyer is not None:
-        session.buyer_json = json.dumps(buyer_input_to_dict(buyer))
+    attempt = get_open_attempt(db, session_id)
+    token = payment_data.token or ""
 
-    # Verify Razorpay Signature if payment_data contains razorpay payload
-    if payment_data.token and "razorpay_order_id" in payment_data.token:
-        try:
-            token_data = json.loads(payment_data.token)
-            rzp_order_id = token_data.get("razorpay_order_id")
-            rzp_payment_id = token_data.get("razorpay_payment_id")
-            rzp_signature = token_data.get("razorpay_signature")
-            
-            # Explicitly verify the order ID against our database to prevent spoofing
-            order_data = json.loads(session.order_json) if session.order_json else {}
-            stored_order_id = order_data.get("id")
-            if not stored_order_id or rzp_order_id != stored_order_id:
-                logger.error(f"Order ID mismatch for session {session_id}. Expected {stored_order_id}, got {rzp_order_id}")
-                raise CheckoutServiceError("Payment verification failed: Order ID mismatch", code="payment_verification_failed")
+    # Dispatch: a Razorpay callback token carries "razorpay_order_id"; anything
+    # else is treated as a legacy delegated token (sandbox-only).
+    if "razorpay_order_id" in token:
+        _capture_razorpay_payment(db, session, attempt, token)
+    else:
+        _capture_delegated_payment(db, session, attempt, payment_data)
 
-            adapter = RazorpayAdapter()
-            is_valid = adapter.verify_payment_signature(
-                rzp_order_id, rzp_payment_id, rzp_signature
-            )
-            if not is_valid:
-                logger.error(f"Invalid Razorpay signature for session {session_id}")
-                raise CheckoutServiceError("Invalid payment signature", code="payment_verification_failed")
-
-            # Update order_json with payment details
-            order_data["payment_id"] = rzp_payment_id
-            order_data["permalink_url"] = f"{DEFAULT_SHOP_URL}/orders/{rzp_order_id}"
-            session.order_json = json.dumps(order_data)
-        except json.JSONDecodeError:
-            pass # Not a JSON token payload
-
-    # Update status
-    session.status = CheckoutStatus.COMPLETED
-
-    # Update message
-    order_data = json.loads(session.order_json) if session.order_json else {}
-    order_id = order_data.get("id", "Unknown")
-
-    complete_messages: list[dict[str, Any]] = [
-        {
-            "type": "info",
-            "param": "$",
-            "content_type": "plain",
-            "content": f"Order {order_id} confirmed! Thank you for your purchase.",
-        }
-    ]
-    session.messages_json = json.dumps(complete_messages)
-
-    session.updated_at = datetime.now(UTC)
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-
-    # Get total from stored JSON for logging
-    totals_data = json.loads(session.totals_json)
-    total_amount = next((t["amount"] for t in totals_data if t["type"] == "total"), 0)
-    logger.info(
-        f"Order {order_id} completed | "
-        f"session={session_id} | "
-        f"total=${total_amount / 100:.2f}"
+    return _finalize_completed(
+        db,
+        session,
+        actor=ACTOR_USER,
+        reason="Payment verified; order confirmed.",
     )
 
-    return session_to_response(session)
 
 
 def complete_checkout_session_from_data(
@@ -950,6 +1181,292 @@ def complete_checkout_session_from_data(
         session_id,
         typed_payment,
         buyer=typed_buyer,
+    )
+
+
+# =============================================================================
+# Provider webhook application (Phase 7-9)
+# =============================================================================
+
+
+#: Outcome tokens returned by :func:`apply_razorpay_webhook_event`. They map onto
+#: the durable ``WebhookProcessingState`` in the route layer.
+WEBHOOK_OUTCOME_CAPTURED = "captured"
+WEBHOOK_OUTCOME_FAILED = "failed"
+WEBHOOK_OUTCOME_ALREADY_PROCESSED = "already_processed"
+WEBHOOK_OUTCOME_AMOUNT_MISMATCH = "amount_mismatch"
+WEBHOOK_OUTCOME_NOT_FOUND = "not_found"
+WEBHOOK_OUTCOME_IGNORED = "ignored"
+
+#: Events we act on. Anything else is durably recorded but ignored.
+_WEBHOOK_HANDLED_EVENTS = frozenset({"payment.captured", "payment.failed"})
+
+
+@dataclass(frozen=True)
+class WebhookApplyResult:
+    """The result of applying one verified provider webhook to our own state.
+
+    ``outcome`` is one of the ``WEBHOOK_OUTCOME_*`` tokens; ``session_id`` and
+    ``provider_order_id`` are echoed back so the route can annotate the durable
+    :class:`WebhookEvent` row for later inspection.
+    """
+
+    outcome: str
+    session_id: str | None = None
+    provider_order_id: str | None = None
+
+
+def apply_razorpay_webhook_event(
+    db: Session,
+    *,
+    event_type: str,
+    payment_entity: dict[str, Any],
+) -> WebhookApplyResult:
+    """Apply an already-verified, already-deduped Razorpay webhook to our state.
+
+    The caller (the webhook route) is responsible for the transport-level
+    guarantees -- verifying the HMAC signature over the *raw* body before this
+    runs, and durably rejecting duplicate deliveries. This function owns the
+    money semantics, and every one of them is defensive:
+
+    * The order id in the webhook is resolved to *our* :class:`PaymentAttempt`;
+      an unknown order id is recorded and ignored, never trusted.
+    * A ``payment.captured`` amount is checked against the amount we signed onto
+      that attempt. A mismatch is refused and audited
+      (:class:`AuditAction.PAYMENT_AMOUNT_MISMATCH_REJECTED`) -- a capture for a
+      different amount than we authorised never moves the session to captured.
+    * Every status change is routed through :func:`_transition`, so the webhook
+      obeys the same closed state machine as the in-band path (a late webhook on
+      an already-terminal session is a no-op, not an illegal jump).
+    * Each money step writes an audit row, so the async path is as explainable
+      as the synchronous one.
+
+    Raises nothing for expected anomalies (unknown order, mismatch, replay);
+    they are returned as outcomes so the route can answer 200 and avoid a
+    provider retry storm. Genuinely illegal transitions surface as
+    :class:`InvalidStateTransitionError` for the route to record.
+    """
+    if event_type not in _WEBHOOK_HANDLED_EVENTS:
+        return WebhookApplyResult(WEBHOOK_OUTCOME_IGNORED)
+
+    order_id = str(payment_entity.get("order_id") or "")
+    payment_id = str(payment_entity.get("id") or "")
+    if not order_id:
+        logger.warning("Razorpay webhook %s missing order_id; ignoring.", event_type)
+        return WebhookApplyResult(WEBHOOK_OUTCOME_NOT_FOUND)
+
+    # The order id is resolved to our own attempt -- the authoritative link
+    # between a provider order and a checkout session (and its signed amount).
+    attempt = get_attempt_by_order_id(db, order_id)
+    if attempt is None:
+        logger.warning("No payment attempt for webhook order %s; ignoring.", order_id)
+        return WebhookApplyResult(
+            WEBHOOK_OUTCOME_NOT_FOUND, provider_order_id=order_id
+        )
+
+    session = db.exec(
+        select(CheckoutSession).where(CheckoutSession.id == attempt.session_id)
+    ).first()
+    if session is None:
+        logger.warning(
+            "Attempt %s references missing session %s; ignoring webhook.",
+            attempt.id,
+            attempt.session_id,
+        )
+        return WebhookApplyResult(
+            WEBHOOK_OUTCOME_NOT_FOUND, provider_order_id=order_id
+        )
+
+    if event_type == "payment.captured":
+        return _apply_captured_webhook(
+            db, session, attempt, payment_entity, order_id, payment_id
+        )
+    return _apply_failed_webhook(
+        db, session, attempt, payment_entity, order_id, payment_id
+    )
+
+
+def _apply_captured_webhook(
+    db: Session,
+    session: CheckoutSession,
+    attempt: Any,
+    payment_entity: dict[str, Any],
+    order_id: str,
+    payment_id: str,
+) -> WebhookApplyResult:
+    """Move a payable session to CAPTURED on an authentic payment.captured."""
+    # Idempotent: an in-band verify (or an earlier webhook) may already have
+    # captured this session. Do not re-audit or re-transition.
+    if session.status in (CheckoutStatus.CAPTURED, CheckoutStatus.COMPLETED):
+        return WebhookApplyResult(
+            WEBHOOK_OUTCOME_ALREADY_PROCESSED,
+            session_id=session.id,
+            provider_order_id=order_id,
+        )
+
+    # The captured amount must equal the amount we signed onto the attribute.
+    # A signature-valid webhook that reports a different amount is refused: the
+    # money we authorised is ours, not whatever the payload claims.
+    reported_amount = payment_entity.get("amount")
+    if reported_amount is not None and int(reported_amount) != attempt.amount_paise:
+        logger.error(
+            "Webhook amount %s != authorised %s for order %s; refusing capture.",
+            reported_amount,
+            attempt.amount_paise,
+            order_id,
+        )
+        record_audit_event(
+            db,
+            action=AuditAction.PAYMENT_AMOUNT_MISMATCH_REJECTED,
+            actor=ACTOR_PROVIDER_RAZORPAY,
+            session_id=session.id,
+            reason=(
+                f"Webhook amount {reported_amount} paise does not match "
+                f"authorised {attempt.amount_paise} paise."
+            ),
+            outcome=AuditOutcome.BLOCKED,
+            amount_paise=attempt.amount_paise,
+            provider_order_id=order_id,
+            provider_payment_id=payment_id,
+            payment_attempt_id=attempt.id,
+            detail={"reported_amount_paise": int(reported_amount)},
+        )
+        return WebhookApplyResult(
+            WEBHOOK_OUTCOME_AMOUNT_MISMATCH,
+            session_id=session.id,
+            provider_order_id=order_id,
+        )
+
+    # READY_FOR_PAYMENT -> PAYMENT_PENDING -> CAPTURED, the same walk the in-band
+    # path takes; the state machine forbids any illegal shortcut.
+    _transition(
+        session,
+        CheckoutStatus.PAYMENT_PENDING,
+        reason="razorpay webhook: payment.captured",
+        action="capture",
+    )
+    mark_attempt_captured(db, attempt=attempt, provider_payment_id=payment_id)
+    _transition(
+        session,
+        CheckoutStatus.CAPTURED,
+        reason="razorpay webhook: payment.captured",
+        action="capture",
+    )
+
+    order_data = json.loads(session.order_json) if session.order_json else {}
+    order_data["payment_id"] = payment_id
+    order_data["permalink_url"] = f"{DEFAULT_SHOP_URL}/orders/{order_id}"
+    order_data.setdefault("checkout_session_id", session.id)
+    session.order_json = json.dumps(order_data)
+    session.updated_at = datetime.now(UTC)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    record_audit_event(
+        db,
+        action=AuditAction.PAYMENT_CAPTURED,
+        actor=ACTOR_PROVIDER_RAZORPAY,
+        session_id=session.id,
+        reason="Payment captured via Razorpay webhook.",
+        outcome=AuditOutcome.SUCCESS,
+        amount_paise=attempt.amount_paise,
+        provider_order_id=order_id,
+        provider_payment_id=payment_id,
+        payment_attempt_id=attempt.id,
+        detail={"source": "webhook"},
+    )
+    return WebhookApplyResult(
+        WEBHOOK_OUTCOME_CAPTURED,
+        session_id=session.id,
+        provider_order_id=order_id,
+    )
+
+
+def _apply_failed_webhook(
+    db: Session,
+    session: CheckoutSession,
+    attempt: Any,
+    payment_entity: dict[str, Any],
+    order_id: str,
+    payment_id: str,
+) -> WebhookApplyResult:
+    """Move a payable session to FAILED on a payment.failed webhook.
+
+    A failure that arrives after we already captured (or completed) is a
+    contradiction we do not act on -- the captured money stands and the event is
+    recorded as already-processed rather than forced through an illegal
+    CAPTURED -> FAILED transition.
+    """
+    if session.status in (
+        CheckoutStatus.CAPTURED,
+        CheckoutStatus.COMPLETED,
+        CheckoutStatus.FAILED,
+    ):
+        return WebhookApplyResult(
+            WEBHOOK_OUTCOME_ALREADY_PROCESSED,
+            session_id=session.id,
+            provider_order_id=order_id,
+        )
+
+    failure_reason = str(
+        payment_entity.get("error_description") or "Payment failed at provider."
+    )
+    failure_code = str(payment_entity.get("error_code") or "")
+
+    _transition(
+        session,
+        CheckoutStatus.PAYMENT_PENDING,
+        reason="razorpay webhook: payment.failed",
+        action="fail",
+    )
+    _transition(
+        session,
+        CheckoutStatus.FAILED,
+        reason=failure_reason,
+        action="fail",
+    )
+    mark_attempt_failed(
+        db,
+        attempt=attempt,
+        reason=failure_reason,
+        code=failure_code,
+        provider_payment_id=payment_id or None,
+    )
+
+    messages = json.loads(session.messages_json) if session.messages_json else []
+    messages.append(
+        {
+            "type": "error",
+            "param": "$",
+            "content_type": "plain",
+            "content": f"Payment failed: {failure_reason}. Please retry.",
+        }
+    )
+    session.messages_json = json.dumps(messages)
+    session.updated_at = datetime.now(UTC)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    record_audit_event(
+        db,
+        action=AuditAction.PAYMENT_FAILED,
+        actor=ACTOR_PROVIDER_RAZORPAY,
+        session_id=session.id,
+        reason=failure_reason,
+        reason_code=failure_code,
+        outcome=AuditOutcome.FAILURE,
+        amount_paise=attempt.amount_paise,
+        provider_order_id=order_id,
+        provider_payment_id=payment_id or None,
+        payment_attempt_id=attempt.id,
+        detail={"source": "webhook"},
+    )
+    return WebhookApplyResult(
+        WEBHOOK_OUTCOME_FAILED,
+        session_id=session.id,
+        provider_order_id=order_id,
     )
 
 
@@ -986,8 +1503,15 @@ def cancel_checkout_session(db: Session, session_id: str) -> CheckoutSessionResp
         logger.warning(f"Session {session_id} already canceled")
         raise InvalidStateTransitionError(session.status.value, "cancel")
 
-    # Update status
-    session.status = CheckoutStatus.CANCELED
+    # Route the status write through the state machine. A CAPTURED (paid) order
+    # cannot be canceled -- it must complete -- so that path raises a 405 rather
+    # than silently discarding a captured payment.
+    _transition(
+        session,
+        CheckoutStatus.CANCELED,
+        reason="checkout canceled by caller",
+        action="cancel",
+    )
 
     # Update message
     cancel_messages: list[dict[str, Any]] = [
@@ -1005,6 +1529,14 @@ def cancel_checkout_session(db: Session, session_id: str) -> CheckoutSessionResp
     db.commit()
     db.refresh(session)
 
+    record_audit_event(
+        db,
+        action=AuditAction.CHECKOUT_CANCELED,
+        actor=ACTOR_USER,
+        session_id=session.id,
+        reason="Checkout session canceled.",
+        outcome=AuditOutcome.SUCCESS,
+    )
     logger.info(f"Session {session_id} canceled")
 
     return session_to_response(session)

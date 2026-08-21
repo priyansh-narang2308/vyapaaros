@@ -47,6 +47,12 @@ def setup_test_environment() -> Generator[None, None, None]:
     original_api_key = os.environ.get("MERCHANT_API_KEY")
     os.environ["MERCHANT_API_KEY"] = TEST_API_KEY
 
+    # Force the hermetic sandbox payment provider so the suite never depends on a
+    # live Razorpay endpoint. Sandbox still performs real HMAC verification, so
+    # signature/amount security tests remain meaningful offline (see provider.py).
+    original_payment_provider = os.environ.get("PAYMENT_PROVIDER")
+    os.environ["PAYMENT_PROVIDER"] = "sandbox"
+
                                                 
     get_settings.cache_clear()
 
@@ -59,6 +65,10 @@ def setup_test_environment() -> Generator[None, None, None]:
         os.environ["MERCHANT_API_KEY"] = original_api_key
     elif "MERCHANT_API_KEY" in os.environ:
         del os.environ["MERCHANT_API_KEY"]
+    if original_payment_provider is not None:
+        os.environ["PAYMENT_PROVIDER"] = original_payment_provider
+    elif "PAYMENT_PROVIDER" in os.environ:
+        del os.environ["PAYMENT_PROVIDER"]
     get_settings.cache_clear()
 
 

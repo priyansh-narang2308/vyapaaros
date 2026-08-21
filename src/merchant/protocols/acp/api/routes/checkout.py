@@ -22,6 +22,7 @@ from src.merchant.api.dependencies import verify_api_key
 from src.merchant.db.database import get_session
 from src.merchant.domain.checkout.service import (
     InvalidStateTransitionError,
+    PaymentVerificationError,
     ProductNotFoundError,
     SessionNotFoundError,
     cancel_checkout_session,
@@ -86,6 +87,19 @@ def _handle_service_error(error: Exception) -> HTTPException:
             detail=ErrorResponse(
                 type=ErrorTypeEnum.METHOD_NOT_ALLOWED,
                 code=ErrorResponseCodeEnum.INVALID_STATUS_TRANSITION,
+                message=error.message,
+            ).model_dump(),
+        )
+
+    # A payment that cannot be verified as authentic and authorised is answered
+    # with 402 Payment Required, not a 500. The money never moved, and the
+    # reason (forged signature, spoofed order id, amount mismatch) is auditable.
+    if isinstance(error, PaymentVerificationError):
+        return HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=ErrorResponse(
+                type=ErrorTypeEnum.INVALID_REQUEST,
+                code=ErrorResponseCodeEnum.INVALID_PAYMENT,
                 message=error.message,
             ).model_dump(),
         )
@@ -300,7 +314,11 @@ def complete_checkout(
             )
 
         return response
-    except (SessionNotFoundError, InvalidStateTransitionError) as e:
+    except (
+        SessionNotFoundError,
+        InvalidStateTransitionError,
+        PaymentVerificationError,
+    ) as e:
         raise _handle_service_error(e) from e
 
 

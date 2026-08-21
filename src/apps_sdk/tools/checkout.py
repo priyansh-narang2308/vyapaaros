@@ -225,8 +225,11 @@ async def process_acp_checkout(
 
                                                   
             if not razorpay_payment_id:
-                                                                                     
-                session_data = update_response.json()
+                # session_data already holds the freshest server state: the
+                # update response on success (line above), else the create
+                # response. Re-reading update_response here would crash when no
+                # fulfillment option existed (it is never assigned) and would
+                # clobber good data with a failed update body otherwise.
                 status = session_data.get("status")
                 provider_session_id = None
                 
