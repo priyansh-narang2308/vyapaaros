@@ -22,7 +22,7 @@ from typing import Any, cast
 
 from sqlmodel import Session
 
-from src.merchant.db.models import CheckoutSession, Product
+from src.merchant.db.models import CheckoutSession, CheckoutStatus, Product
 from src.merchant.domain.checkout.models import (
     Address,
     AddressInput,
@@ -804,6 +804,36 @@ def check_ready_for_payment(session: CheckoutSession) -> bool:
     return session.selected_fulfillment_option_id is not None
 
 
+def _acp_visible_status(status: CheckoutStatus) -> CheckoutStatusEnum:
+    """Map an internal money state onto the ACP-visible status vocabulary.
+
+    The database tracks fine-grained money states (``awaiting_approval``,
+    ``payment_pending``, ``captured``, ``failed``, ``retry_allowed``) that the
+    ACP wire contract does not define. The ACP response exposes only the four
+    protocol statuses, so an internal state is projected onto the closest one
+    instead of leaking a value the client's schema would reject:
+
+    * a session waiting on human approval is *not yet* payable -> not_ready
+    * a payment in flight or recoverable failure is still payable -> ready
+    * a captured payment reads as completed to the buyer
+
+    Without this projection, serialising a session in any of the new states
+    raises ``ValueError`` and the endpoint returns 500.
+    """
+    mapping = {
+        CheckoutStatus.NOT_READY_FOR_PAYMENT: CheckoutStatusEnum.NOT_READY_FOR_PAYMENT,
+        CheckoutStatus.AWAITING_APPROVAL: CheckoutStatusEnum.NOT_READY_FOR_PAYMENT,
+        CheckoutStatus.READY_FOR_PAYMENT: CheckoutStatusEnum.READY_FOR_PAYMENT,
+        CheckoutStatus.PAYMENT_PENDING: CheckoutStatusEnum.READY_FOR_PAYMENT,
+        CheckoutStatus.FAILED: CheckoutStatusEnum.READY_FOR_PAYMENT,
+        CheckoutStatus.RETRY_ALLOWED: CheckoutStatusEnum.READY_FOR_PAYMENT,
+        CheckoutStatus.CAPTURED: CheckoutStatusEnum.COMPLETED,
+        CheckoutStatus.COMPLETED: CheckoutStatusEnum.COMPLETED,
+        CheckoutStatus.CANCELED: CheckoutStatusEnum.CANCELED,
+    }
+    return mapping.get(status, CheckoutStatusEnum.NOT_READY_FOR_PAYMENT)
+
+
 def session_to_response(session: CheckoutSession) -> CheckoutSessionResponse:
     """Convert CheckoutSession database model to API response.
 
@@ -884,7 +914,7 @@ def session_to_response(session: CheckoutSession) -> CheckoutSessionResponse:
             provider=PaymentProviderEnum.STRIPE,
             supported_payment_methods=[PaymentMethodEnum.CARD],
         ),
-        status=CheckoutStatusEnum(session.status.value),
+        status=_acp_visible_status(session.status),
         currency=session.currency.lower(),
         line_items=line_items,
         fulfillment_address=fulfillment_address,

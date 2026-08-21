@@ -313,7 +313,10 @@ async def process_acp_checkout(
             order_id = order.get("id")
 
             if complete_response.status_code in (200, 201):
-                from src.apps_sdk.tools.cart import carts
+                # NOTE: `carts` is imported at module scope. A function-local
+                # `import carts` here previously made the name local to this
+                # entire function, so the read at the top of process_acp_checkout
+                # raised UnboundLocalError before it was ever bound.
                 carts[cart_id] = []
                 logger.info(f"Checkout completed successfully: {order_id}")
                 _emit_event(

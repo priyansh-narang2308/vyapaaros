@@ -1,17 +1,3 @@
-                                                    
-                                     
- 
-                                                                 
-                                                                  
-                                         
- 
-                                            
- 
-                                                                     
-                                                                   
-                                                                          
-                                                                     
-                                
 
 """Tests for the checkout session API endpoints."""
 
@@ -881,7 +867,8 @@ class TestCheckoutSessionResponseFormat:
         )
         data = response.json()
 
-        assert data["currency"] == "usd"
+        # VyapaarOS settles in INR via Razorpay; ACP requires lowercase ISO 4217.
+        assert data["currency"] == "inr"
 
     def test_line_item_has_all_required_fields(self, auth_client: TestClient) -> None:
         """Edge case: Line items contain all required fields."""

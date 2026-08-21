@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
 
+    # Which payment provider is active: "razorpay" (live) or "sandbox" (offline).
+    # Defaults to razorpay so the offline sandbox can never activate by accident;
+    # a missing live key raises instead of silently degrading into a mock.
+    payment_provider: str = "razorpay"
+
+    # Secrets used by the offline sandbox provider. It performs real HMAC-SHA256
+    # signing and verification against these, so forged signatures are rejected
+    # in sandbox mode exactly as they are in live mode.
+    sandbox_payment_secret: str = "vyapaaros_sandbox_key_secret"
+    sandbox_webhook_secret: str = "vyapaaros_sandbox_webhook_secret"
+
                                  
     ucp_version: str = "2026-01-23"
     ucp_base_url: str | None = (

@@ -22,7 +22,12 @@ from typing import Any, cast
 
 from sqlmodel import Session, select
 
-from src.merchant.db.models import CheckoutSession, CheckoutStatus, Product
+from src.merchant.db.models import (
+    CheckoutSession,
+    CheckoutStatus,
+    PaymentAttemptState,
+    Product,
+)
 from src.merchant.domain.checkout.calculations import (
     DEFAULT_CURRENCY,
     DEFAULT_SHOP_URL,
@@ -45,8 +50,38 @@ from src.merchant.domain.checkout.models import (
     PaymentDataInput,
     UpdateCheckoutRequest,
 )
-from src.merchant.domain.checkout.policy import evaluate_order_value_policy
-from src.merchant.services.payment_adapter import RazorpayAdapter
+from src.merchant.domain.payments.attempts import (
+    AmountResolutionError,
+    authoritative_total_paise,
+    create_payment_attempt,
+    ensure_order_for_attempt,
+    find_granted_approval,
+    get_open_attempt,
+    mark_attempt_captured,
+    mark_attempt_failed,
+    open_approval_request,
+)
+from src.merchant.domain.payments.audit import (
+    ACTOR_SYSTEM,
+    ACTOR_USER,
+    AuditAction,
+    AuditOutcome,
+    record_audit_event,
+)
+from src.merchant.domain.payments.policy import (
+    PolicyDecision,
+    evaluate_order_value_policy,
+)
+from src.merchant.domain.payments.provider import (
+    PaymentProviderError,
+    get_payment_provider,
+    is_sandbox_active,
+)
+from src.merchant.domain.payments.state_machine import (
+    InvalidPaymentTransitionError,
+    assert_transition,
+    is_transition_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +128,19 @@ class InvalidStateTransitionError(CheckoutServiceError):
             message=f"Cannot {action} session with status '{current_status}'",
             code="invalid_status_transition",
         )
+
+
+class PaymentVerificationError(CheckoutServiceError):
+    """Raised when a payment cannot be verified as authentic and authorised.
+
+    Distinct from :class:`InvalidStateTransitionError` so the API can answer a
+    forged signature, a spoofed order id, or an amount mismatch with a clean
+    ``402 Payment Required`` instead of a generic 500. This is the "one failure
+    handled gracefully" path: the money never moves and the reason is auditable.
+    """
+
+    def __init__(self, message: str, code: str = "payment_verification_failed"):
+        super().__init__(message=message, code=code)
 
 
 # =============================================================================
@@ -303,6 +351,258 @@ def get_checkout_session(db: Session, session_id: str) -> CheckoutSessionRespons
     return session_to_response(session)
 
 
+# =============================================================================
+# Payment preparation (Phase 2/3/6/11): the only path that makes a cart payable
+# =============================================================================
+
+
+def _policy_message(text: str) -> dict[str, Any]:
+    """Build a client-visible policy-gate message."""
+    return {
+        "type": "error",
+        "param": "policy_gate",
+        "content_type": "plain",
+        "content": f"[POLICY GATE]: {text}",
+    }
+
+
+def _transition(
+    session: CheckoutSession,
+    target: CheckoutStatus,
+    *,
+    reason: str,
+    action: str = "update",
+) -> None:
+    """Route a status write through the closed-whitelist state machine.
+
+    The LLM never assigns ``session.status`` directly; every write goes through
+    here. Assigning the current state is treated as a no-op (so re-preparing an
+    already-ready session does not trip the "no self-loop" rule), and an illegal
+    move is surfaced as a clean ``405`` rather than an uncaught 500.
+    """
+    if session.status == target:
+        return
+    try:
+        session.status = assert_transition(session.status, target, reason=reason)
+    except InvalidPaymentTransitionError as exc:
+        logger.warning(
+            "Blocked illegal transition %s -> %s for session %s: %s",
+            session.status.value,
+            target.value,
+            session.id,
+            reason,
+        )
+        raise InvalidStateTransitionError(session.status.value, action) from exc
+
+
+def _walk_back_to_not_ready(session: CheckoutSession, *, reason: str) -> None:
+    """Move a session back to NOT_READY when it cannot be made payable."""
+    if is_transition_allowed(session.status, CheckoutStatus.NOT_READY_FOR_PAYMENT):
+        session.status = assert_transition(
+            session.status, CheckoutStatus.NOT_READY_FOR_PAYMENT, reason=reason
+        )
+
+
+def _prepare_session_for_payment(
+    db: Session, session: CheckoutSession
+) -> tuple[str, list[dict[str, Any]]]:
+    """Price, gate, and (if permitted) open a payable order for a ready session.
+
+    This is the single place a checkout becomes payable, and it is a backend
+    path the model cannot reach. It recomputes the amount from server-side
+    totals, runs the deterministic policy engine, and then either
+
+    * denies (``-> not_ready_for_payment``) an order that violates a hard limit,
+    * raises an approval gate (``-> awaiting_approval``) for a high-value order
+      with no matching human approval, or
+    * opens exactly one payment attempt + provider order and moves the session
+      to ``ready_for_payment``.
+
+    Returns the banner message and any policy messages to surface to the client.
+    """
+    session_id = session.id
+    messages: list[dict[str, Any]] = []
+
+    # 1. The amount is ours -- recomputed from stored totals, never the client's.
+    try:
+        amount_paise = authoritative_total_paise(session)
+    except AmountResolutionError as exc:
+        logger.error("Cannot price session %s: %s", session_id, exc)
+        _walk_back_to_not_ready(session, reason="amount could not be resolved")
+        return "Unable to price this order. Please review your cart.", messages
+
+    # 2. Deterministic policy decision, recorded before anything acts on it.
+    decision = evaluate_order_value_policy(amount_paise)
+    record_audit_event(
+        db,
+        action=AuditAction.POLICY_EVALUATED,
+        actor=ACTOR_SYSTEM,
+        session_id=session_id,
+        reason_code=decision.reason_code.value,
+        reason=decision.reason,
+        policy_decision=decision.decision.value,
+        outcome=AuditOutcome.INFO,
+        amount_paise=amount_paise,
+        detail=decision.to_dict(),
+    )
+
+    if decision.denied:
+        record_audit_event(
+            db,
+            action=AuditAction.POLICY_DENIED,
+            actor=ACTOR_SYSTEM,
+            session_id=session_id,
+            reason_code=decision.reason_code.value,
+            reason=decision.reason,
+            policy_decision=decision.decision.value,
+            outcome=AuditOutcome.BLOCKED,
+            amount_paise=amount_paise,
+        )
+        _walk_back_to_not_ready(session, reason=decision.reason_code.value)
+        messages.append(_policy_message(decision.reason))
+        return "This order cannot be completed as configured.", messages
+
+    if decision.requires_approval:
+        approval = find_granted_approval(
+            db, session_id=session_id, amount_paise=amount_paise
+        )
+        if approval is None:
+            open_approval_request(
+                db, session_id=session_id, decision=decision, amount_paise=amount_paise
+            )
+            _transition(
+                session,
+                CheckoutStatus.AWAITING_APPROVAL,
+                reason=decision.reason_code.value,
+            )
+            record_audit_event(
+                db,
+                action=AuditAction.APPROVAL_REQUIRED,
+                actor=ACTOR_SYSTEM,
+                session_id=session_id,
+                reason_code=decision.reason_code.value,
+                reason=decision.reason,
+                policy_decision=decision.decision.value,
+                outcome=AuditOutcome.PENDING,
+                amount_paise=amount_paise,
+            )
+            messages.append(
+                _policy_message(f"{decision.reason} Manual approval is required.")
+            )
+            return "This order needs approval before payment.", messages
+
+        # A live, exact-amount approval exists: record the grant and continue.
+        record_audit_event(
+            db,
+            action=AuditAction.APPROVAL_GRANTED,
+            actor=ACTOR_USER,
+            session_id=session_id,
+            reason_code="APPROVAL_GRANTED",
+            reason=f"Approval {approval.id} authorises this amount.",
+            policy_decision=decision.decision.value,
+            outcome=AuditOutcome.SUCCESS,
+            amount_paise=amount_paise,
+            detail={"approval_id": approval.id, "approved_by": approval.approved_by},
+        )
+
+    # 3. Open (or reuse) exactly one payment attempt and its provider order.
+    return _open_payable_order(db, session, amount_paise, decision, messages)
+
+
+def _open_payable_order(
+    db: Session,
+    session: CheckoutSession,
+    amount_paise: int,
+    decision: PolicyDecision,
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Ensure one attempt + one provider order exist, then mark session ready."""
+    session_id = session.id
+    provider = get_payment_provider()
+
+    # Reuse the open attempt unless the cart value changed since it was opened;
+    # a stale attempt (and its order) must never be payable at the new amount.
+    attempt = get_open_attempt(db, session_id)
+    if attempt is not None and attempt.amount_paise != amount_paise:
+        attempt.state = PaymentAttemptState.ABANDONED
+        attempt.updated_at = datetime.now(UTC)
+        db.add(attempt)
+        db.commit()
+        attempt = None
+
+    if attempt is None:
+        attempt = create_payment_attempt(
+            db,
+            session_id=session_id,
+            amount_paise=amount_paise,
+            currency=session.currency,
+            provider=provider.name,
+            policy_decision=decision,
+        )
+        record_audit_event(
+            db,
+            action=AuditAction.PAYMENT_ATTEMPT_CREATED,
+            actor=ACTOR_SYSTEM,
+            session_id=session_id,
+            reason_code=decision.reason_code.value,
+            reason="Payment attempt opened.",
+            policy_decision=decision.decision.value,
+            outcome=AuditOutcome.SUCCESS,
+            amount_paise=amount_paise,
+            payment_attempt_id=attempt.id,
+        )
+
+    try:
+        order = ensure_order_for_attempt(
+            db, attempt=attempt, provider=provider, receipt=session_id
+        )
+    except PaymentProviderError as exc:
+        logger.error("Provider order creation failed for %s: %s", session_id, exc)
+        record_audit_event(
+            db,
+            action=AuditAction.PAYMENT_ORDER_CREATION_FAILED,
+            actor=ACTOR_SYSTEM,
+            session_id=session_id,
+            reason="Provider order creation failed.",
+            outcome=AuditOutcome.FAILURE,
+            amount_paise=amount_paise,
+            payment_attempt_id=attempt.id,
+            detail={"error": str(exc)},
+        )
+        _walk_back_to_not_ready(session, reason="provider order creation failed")
+        return "Unable to create payment order. Please try again shortly.", messages
+
+    session.order_json = json.dumps(
+        {
+            "provider": order.provider,
+            "id": order.id,
+            "checkout_session_id": session_id,
+            "amount": order.amount_paise,
+            "currency": order.currency,
+            "payment_attempt_id": attempt.id,
+        }
+    )
+    _transition(
+        session,
+        CheckoutStatus.READY_FOR_PAYMENT,
+        reason="policy allowed; provider order created",
+    )
+    record_audit_event(
+        db,
+        action=AuditAction.PAYMENT_ORDER_CREATED,
+        actor=ACTOR_SYSTEM,
+        session_id=session_id,
+        reason_code=decision.reason_code.value,
+        reason="Provider order created; session ready for payment.",
+        policy_decision=decision.decision.value,
+        outcome=AuditOutcome.SUCCESS,
+        amount_paise=amount_paise,
+        provider_order_id=order.id,
+        payment_attempt_id=attempt.id,
+    )
+    return "Ready for payment! Review your order and proceed.", messages
+
+
 async def update_checkout_session(
     db: Session, session_id: str, request: UpdateCheckoutRequest
 ) -> CheckoutSessionResponse:
@@ -444,49 +744,20 @@ async def update_checkout_session(
     )
     session.totals_json = json.dumps(updated_totals)
 
-    # Check if ready for payment and update status
+    # Check if ready for payment and update status. All pricing, policy gating,
+    # provider-order creation, and the state transition live in the payments
+    # domain (_prepare_session_for_payment) so the agent path cannot reach them.
     base_message = "Welcome to checkout! Please complete all required fields."
-    policy_messages = []
-    
+    policy_messages: list[dict[str, Any]] = []
+
     if check_ready_for_payment(session):
-        # 1. Calculate total order value
-        total_amount = next((t["amount"] for t in updated_totals if t["type"] == "total"), 0)
-
-        # 2. Run Policy Engine constraints
-        policy_decision = evaluate_order_value_policy(total_amount)
-        if policy_decision.requires_approval:
-            # We don't block order creation, but we explicitly log the requirement
-            logger.info(f"Session {session_id} requires manual approval: {policy_decision.reason}")
-            policy_messages.append({
-                "type": "error",
-                "param": "policy_gate",
-                "content_type": "plain",
-                "content": f"[POLICY GATE]: {policy_decision.reason} - Manual Approval Required"
-            })
-
-        # 3. Create Razorpay Order
-        adapter = RazorpayAdapter()
-        try:
-            rzp_order = adapter.create_order(
-                amount_paise=total_amount,
-                currency=session.currency,
-                receipt=session_id
-            )
-            # Store Razorpay order info
-            session.order_json = json.dumps({
-                "provider": "razorpay",
-                "id": rzp_order["id"],
-                "checkout_session_id": session_id,
-                "amount": rzp_order["amount"],
-            })
-            session.status = CheckoutStatus.READY_FOR_PAYMENT
-            base_message = "Ready for payment! Review your order and proceed."
-        except Exception as e:
-            logger.error(f"Failed to create Razorpay Order for session {session_id}: {e}")
-            session.status = CheckoutStatus.NOT_READY_FOR_PAYMENT
-            base_message = "Unable to create payment order. Please try again later."
+        base_message, policy_messages = _prepare_session_for_payment(db, session)
     else:
-        session.status = CheckoutStatus.NOT_READY_FOR_PAYMENT
+        _transition(
+            session,
+            CheckoutStatus.NOT_READY_FOR_PAYMENT,
+            reason="required checkout fields incomplete",
+        )
 
     session.messages_json = json.dumps(
         [
