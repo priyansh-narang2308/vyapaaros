@@ -64,7 +64,7 @@ function ProductCard({ product, onAddToCart, onProductClick }: ProductCardProps)
 
       {}
       <div className="flex flex-1 flex-col gap-0.5 px-2.5 pt-2.5 pb-1.5">
-        <h3 className="text-sm font-medium text-text leading-tight truncate">{product.name}</h3>
+        <h3 className="text-sm font-medium text-text leading-tight line-clamp-2">{product.name}</h3>
         <div className="flex items-center justify-between text-[11px] text-text-secondary">
           <span className="truncate">{variantLabel || "Standard"}</span>
           <span className="flex items-center gap-0.5 flex-shrink-0">
@@ -102,7 +102,7 @@ export function RecommendationCarousel({
 
   return (
     <section className="py-4">
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 gap-4">
         {products.map((product) => (
           <ProductCard
             key={product.id}

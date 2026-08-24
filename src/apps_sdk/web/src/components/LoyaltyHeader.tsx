@@ -1,4 +1,5 @@
 import { ShoppingBag } from "lucide-react";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import type { MerchantUser } from "@/types";
 
 interface LoyaltyHeaderProps {
@@ -36,6 +37,7 @@ export function LoyaltyHeader({
             </span>
           </div>
 
+          <ThemeToggle />
           {onCartClick && (
             <button
               type="button"
