@@ -366,18 +366,15 @@ class TestCallSearchAgent:
         assert result["results"][0]["product_id"] == "prod_1"
 
     @pytest.mark.asyncio
-    async def test_search_agent_timeout_returns_error(self) -> None:
-        """Timeout returns empty results with error message."""
+    async def test_search_agent_timeout_falls_back_to_local(self) -> None:
+        """When NAT agent times out, gracefully degrade to local catalog search."""
         from src.apps_sdk.tools.recommendations import call_search_agent
 
-        with patch("httpx.AsyncClient") as mock_client:
-            mock_instance = AsyncMock()
-            mock_instance.post.side_effect = httpx.TimeoutException("Timeout")
-            mock_instance.__aenter__.return_value = mock_instance
-            mock_instance.__aexit__.return_value = None
-            mock_client.return_value = mock_instance
+        with patch("src.apps_sdk.tools.recommendations._call_nat_search_agent") as mock_nat:
+            mock_nat.return_value = {}  # Simulate NAT agent failure
 
             result = await call_search_agent(query="summer tee", category=None, limit=3)
 
-        assert result["results"] == []
-        assert "timeout" in result["error"].lower()
+        # Local fallback should return results instead of an error
+        assert len(result["results"]) > 0
+        assert "error" not in result

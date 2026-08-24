@@ -150,7 +150,79 @@ async def _fetch_product_from_merchant(product_id: str) -> dict[str, Any] | None
         return None
 
 
-async def call_search_agent(
+def _local_catalog_search(
+    query: str,
+    category: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Lightweight local search over the product catalog.
+
+    Uses keyword matching against the static catalog (name, description,
+    category, subcategory, attributes). This runs in-process with zero
+    external dependencies, so the demo works even when the heavy NAT
+    RAG search agent (Milvus + GPU embeddings) is offline.
+
+    The real agent is always tried first; this is the graceful-degradation
+    fallback that keeps the merchant transactable for AI buyers regardless
+    of infrastructure availability.
+    """
+    from src.data.product_catalog import PRODUCTS
+
+    q_tokens = set(query.lower().split())
+    scored: list[tuple[float, dict[str, Any]]] = []
+
+    for p in PRODUCTS:
+        # Category filter
+        if category and category.lower() != p.get("category", "").lower():
+            continue
+
+        # Build searchable text blob
+        searchable = " ".join([
+            p.get("name", ""),
+            p.get("description", ""),
+            p.get("category", ""),
+            p.get("subcategory", ""),
+            " ".join(p.get("attributes", [])),
+        ]).lower()
+
+        # Score = fraction of query tokens found in the product text
+        hits = sum(1 for t in q_tokens if t in searchable)
+        if hits == 0:
+            continue
+        score = hits / len(q_tokens)
+        scored.append((score, p))
+
+    # Sort by score descending, then take top `limit`
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+    for score, p in scored[:limit]:
+        results.append({
+            "product_id": p["id"],
+            "similarity": round(score, 3),
+            "score": round(1.0 - score, 3),
+            "distance": round(1.0 - score, 3),
+        })
+
+    # If no keyword matches, return top products as a sensible default
+    if not results:
+        for p in PRODUCTS[:min(limit, 6)]:
+            results.append({
+                "product_id": p["id"],
+                "similarity": 0.4,
+                "score": 0.6,
+                "distance": 0.6,
+            })
+
+    logger.info(
+        "Local catalog search for '%s' returned %d results (fallback mode)",
+        query,
+        len(results),
+    )
+    return {"query": query, "results": results}
+
+
+async def _call_nat_search_agent(
     query: str,
     category: str | None,
     limit: int,
@@ -167,7 +239,7 @@ async def call_search_agent(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
                 f"{SEARCH_AGENT_URL}/generate",
                 json=payload,
@@ -179,14 +251,30 @@ async def call_search_agent(
                 "query": parsed.get("query", query),
                 "results": parsed.get("results", []),
             }
-    except httpx.TimeoutException:
-        return {"results": [], "error": "Search agent timeout"}
-    except httpx.HTTPStatusError as e:
-        return {"results": [], "error": f"Agent error: {e.response.status_code}"}
-    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-        return {"results": [], "error": f"Search agent unavailable: {e}"}
-    except Exception as e:
-        return {"results": [], "error": str(e)}
+    except Exception:
+        return {}
+
+
+async def call_search_agent(
+    query: str,
+    category: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Search products via the NAT RAG agent, falling back to local catalog.
+
+    Tries the full vector-search agent first (Milvus + GPU embeddings).
+    If that is unavailable — timeout, connection refused, empty results —
+    falls back to a lightweight in-process keyword search over the static
+    product catalog. This graceful-degradation path ensures the merchant
+    remains transactable by AI buyers even without heavy infrastructure.
+    """
+    agent_result = await _call_nat_search_agent(query, category, limit)
+    if agent_result.get("results"):
+        logger.info("NAT search agent returned %d results", len(agent_result["results"]))
+        return agent_result
+
+    # Graceful degradation: local catalog search
+    return _local_catalog_search(query, category, limit)
 
 
 async def search_products(

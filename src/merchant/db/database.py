@@ -40,7 +40,7 @@ def get_engine():
         _engine = create_engine(
             settings.database_url,
             echo=settings.log_sql,                                        
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 15},
         )
     return _engine
 
