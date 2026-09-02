@@ -12,6 +12,10 @@ Use this document when:
 
 Do not duplicate canonical run commands or quality gates here. Keep those in `AGENTS.md`.
 
+
+
+
+
 ## Authority And Precedence
 
 When guidance conflicts, use this precedence:
